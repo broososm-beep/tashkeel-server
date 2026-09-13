@@ -1,3 +1,4 @@
 flask
-arabic-diacritizer
+text2tashkeel
+onnxruntime
 gunicorn

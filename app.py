@@ -11,38 +11,50 @@
 PyTorch/TensorFlow، ولا شبكة أثناء التشغيل. يحل انهيار الذاكرة (OOM)
 الذي سببه المحرك السابق على خطط Render المجانية (512MB).
 """
+import logging
 import os
 import threading
+import traceback
 
 from flask import Flask, request, jsonify
+
+# تقييد خيوط onnxruntime إلى خيط واحد (أذكى مع gunicorn وأخفّ ذاكرة).
+os.environ.setdefault("TT_ORT_THREADS", "1")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("tashkeel")
 
 app = Flask(__name__)
 
 _diacritizer = None
 _di_lock = threading.Lock()
-_warmup_started = threading.Event()
 
 
 def get_diacritizer():
-    """يحمّل محرك التشكيل مرة واحدة فقط (خيط آمن) ثم يعيد استخدامه."""
+    """يحمّل محرك التشكيل مرة واحدة فقط (خيط آمن) ثم يعيد استخدامه.
+
+    التحميل كسول عند أول طلب عربي (لا خيط خلفي عند الإقلاع، فلا تُبنى جلسة
+    onnxruntime خلف gunicorn fork).
+    """
     global _diacritizer
     if _diacritizer is None:
         with _di_lock:
             if _diacritizer is None:
-                from text2tashkeel import Diacritizer
-                _diacritizer = Diacritizer()
+                try:
+                    from text2tashkeel import Diacritizer
+                    _di = Diacritizer()
+                    _diacritizer = _di
+                except Exception:
+                    logger.error("فشل تحميل محرك التشكيل:\n%s", traceback.format_exc())
+                    raise
+                # تهيئة مسبقة خفيفة: أول استدعاء يبني جلسة ORT ويخزنها.
+                # أي خطأ هنا مؤقت والطلبات التالية ستنجح.
+                try:
+                    _di.diacritize("بسم الله")
+                except Exception:
+                    logger.warning("تهيئة محرك التشكيل (قد تنجح الطلبات التالية):\n%s",
+                                   traceback.format_exc())
     return _diacritizer
-
-
-def _warmup():
-    """تهيئة مسبقة عند الإقلاع كي يكون أول طلب فوريًا (خارج مهلة الطلب)."""
-    if _warmup_started.is_set():
-        return
-    _warmup_started.set()
-    try:
-        get_diacritizer().diacritize("بسم الله الرحمن الرحيم")
-    except Exception:
-        pass
 
 
 def is_arabic_text(text):
@@ -63,17 +75,13 @@ def tashkeel():
         result = get_diacritizer().diacritize(text)
         return jsonify({"diacritized": result})
     except Exception:
+        logger.error("فشل عملية التشكيل:\n%s", traceback.format_exc())
         return jsonify({"error": "diacritization failed"}), 500
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
-
-
-# تهيئة مسبقة خلفية عند إقلاع gunicorn (لا تحجب الخادم)
-if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-    threading.Thread(target=_warmup, daemon=True).start()
 
 
 if __name__ == "__main__":

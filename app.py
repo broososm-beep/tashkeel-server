@@ -20,7 +20,7 @@ Endpoints جديدة (إضافية، اختيارية):
 
 بيئة التشغيل (Environment Variables على Render):
     GEMINI_API_KEY   مفتاح Google Gemini (إلزامي للمسار السياقي LLM؛ بدونه LLM=ONNX)
-    GEMINI_MODEL     النموذج، افتراضي gemini-2.5-flash
+    GEMINI_MODEL     النموذج، افتراضي gemini-3.6-flash (عند مستخدم جديد 2.5-flash غير متاح — يرجع Google 404)
     GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 12
     TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-SA-HamedNeural
     TTS_ENABLED      true|false يعطل/يفعل /tts ، افتراضي true
@@ -51,7 +51,9 @@ app = Flask(__name__)
 #  الإعدادات من بيئة التشغيل (متغيرات Render)
 # ─────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = (
+    os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip().replace("models/", "")
+)
 GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "12"))
 MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "6000"))
 
@@ -136,8 +138,20 @@ def _llm_diacritize(text):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.error(
+            "Gemini رفض الطلب (HTTP %s) — تفاصيل جوجل:\n%s",
+            exc.code,
+            detail[:3000],
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطأ اتصال بـ Gemini: %s:%s", type(exc).__name__, exc)
+        return None
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError, TypeError):

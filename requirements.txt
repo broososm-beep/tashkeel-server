@@ -2,3 +2,4 @@ flask
 text2tashkeel
 onnxruntime
 gunicorn
+edge-tts

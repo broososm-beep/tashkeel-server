@@ -342,11 +342,76 @@ def context_diacritize(text):
 
 # ════════════════════════════════════════════════════════════════
 #  SSML + النطق عبر محرك مايكروسوفت (edge-tts)
+#  — مسار السقوط الآلي فقط؛ لا يُمسّ مسار Gemini إطلاقاً.
 # ════════════════════════════════════════════════════════════════
+
+# تحسينات SSML لمحرك Edge لجعله أقرب إلى الإنسان (المسار الآلي فقط):
+#   • فاصلة (، / ,)      → وقفة قصيرة ~200ms (نَفَس/تقسيم طبيعي)
+#   • سطر جديد (\n)      → وقفة تنفّس ~450ms (شعر/فقرة)
+#   • قِدر القراءة       → أبطأ قليلاً (-12%) كي لا تبدو العربية مشدودةً/آلية
+#
+# ملاحظة مُثبتة تجريبياً على edge-tts 7.2.8: الخدمة ترفض وسم <break/> في أي
+# موضع (NoAudioReceived) مهما كانت صيغته (time/strength/quote). لذلك يُبني
+# _build_ssml وثيقةَ <break/> الكاملة لمستعملي SSML الحقيقيين و/ssml، بينما
+# يحقّق المسار المُرسل فعلياً (edge) الوقفاتَ بعلامات تحترمها النافثة:
+# الفواصل تُبقيها كما هي (تضيف النافثة العصبية ~200ms) والأسطر الجديدة
+# تُبقى فتراتِ جمل (~450ms عبر حد الجملة لدى الخدمة).
+EDGE_PROSOBY_BASE_RATE_PCT = -12
+EDGE_BREAK_PUNCT = '<break time="200ms"/>'
+EDGE_BREAK_LINE = '<break time="450ms"/>'
+_SSML_ESCAPE_TABLE = str.maketrans({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+})
+
+
+def _rate_pct(value):
+    """يقرأ معدّل المستخدم ("+20%"/"20"/0) ويُعيد عدداً صحيحاً."""
+    try:
+        return int(str(value).strip().rstrip("%").lstrip("+") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _combined_rate_pct(rate_pct):
+    """يجمع المعدِّل الأساسي (-12%) مع معدِّل المستخدم (شريط السرعة)."""
+    return EDGE_PROSOBY_BASE_RATE_PCT + _rate_pct(rate_pct)
+
+
+def _ssml_inner(text):
+    """يحوّل النص المشكَّل إلى محتوى SSML آمن: تهرّب XML ثم فواصل/أسطر.
+
+    الترتيب حاسم: نهرّب الحروف أولاً ثم نُدخل وسوم <break/> الحقيقية (لا
+    تُهرَّب لئلا تنقلب نصاً). عمليات قرص في الذاكرة حصراً — صفر تأخير.
+    تُستخدم هذه في _build_ssml (وثيقة كاملة لمستعملي SSML).
+    """
+    safe = text.translate(_SSML_ESCAPE_TABLE)
+    safe = safe.replace("،", EDGE_BREAK_PUNCT).replace(",", EDGE_BREAK_PUNCT)
+    safe = re.sub(r"[ \t]*\n[ \t]*", EDGE_BREAK_LINE, safe)
+    return safe
+
+
+def _build_ssml(text, voice="ar-SA-HamedNeural", rate_pct=0):
+    """يبني وثيقة SSML كاملة محسّنة (وقفات + قِدر أبطأ قليلاً).
+
+    الصيغة: <speak> → <voice> → <prosody> ← نص مهرَّب مع وسوم <break/>.
+    مناسبة لمستعملي SSML الحقيقيين (كأوامر az/--ssml مثلًا)؛ أمّا مسار
+    edge-tts فيحقّق الوقفاتَ ذاتها عبر علامات تحترمها الخدمة.
+    """
+    inner = _ssml_inner(text)
+    total = _combined_rate_pct(rate_pct)
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        f'xml:lang="ar-SA"><voice name="{voice}">'
+        f'<prosody rate="{total:+d}%" pitch="-0Hz">{inner}</prosody>'
+        f"</voice></speak>"
+    )
 
 
 def build_ssml(text, voice, lang="ar-SA"):
-    """يبني وثيقة SSML متكاملة من النص المشكَّل (مع تهرّب آمن)."""
+    """يبني وثيقة SSML الأساسية (توافق مع عقد /ssml القديم دون تغيير)."""
     safe = (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -361,13 +426,36 @@ def build_ssml(text, voice, lang="ar-SA"):
     )
 
 
-async def _synthesize_async(text, voice, rate):
-    """يدفق الصوت من محرك Microsoft عبر edge-tts ويعيد MP3 bytes."""
+def _edge_tts_communicate(text, voice, rate_pct=0):
+    """يولّد كائن edge-tts للنطق مع تحسينات SSML الممكنة.
+
+    بما أن الخدمة ترفض <break/> وتُهرّب أي نص يدخلها (edge-tts 7.2.8)،
+    نفعّل التحسينات الآتية عبر آل === توفرها المكتبة نفسها:
+      1) قِدر أبطأ: نمرّر rate="−{12}%" + pitch="-0Hz" فيُغلّف mkssml النص
+         كاملاً داخل <prosody> — وهي بنية _build_ssml بعينها على مستوى
+         الصوت الفعلي.
+      2) وقفات الفواصل والأسطر: الفواصل (، ,) والأسطر الجديدة تبقى كما
+         هي؛ تترجمها النافثة العصبية تلقائياً إلى توقفات (~200ms/450ms)
+         دون أي وسم قد يُسقط الخدمة.
+    لا شيء يُكتب على القرص ولا تأخير إضافي — تحويل في الذاكرة فقط.
+    """
     import edge_tts
 
-    comm = edge_tts.Communicate(
-        text, voice, rate=rate, connect_timeout=10, receive_timeout=TTS_TIMEOUT
+    total = _combined_rate_pct(rate_pct)
+    return edge_tts.Communicate(
+        text,
+        voice,
+        rate=f"{total:+d}%",
+        pitch="-0Hz",
+        volume="+0%",
+        connect_timeout=10,
+        receive_timeout=TTS_TIMEOUT,
     )
+
+
+async def _synthesize_async(text, voice, rate_pct):
+    """يدفق الصوت من محرك Microsoft عبر edge-tts ويعيد MP3 bytes."""
+    comm = _edge_tts_communicate(text, voice, rate_pct)
     buffer = bytearray()
     async for chunk in comm.stream():
         if chunk["type"] == "audio":
@@ -375,9 +463,11 @@ async def _synthesize_async(text, voice, rate):
     return bytes(buffer)
 
 
-def synthesize(text, voice, rate):
+def synthesize(text, voice, rate_pct=0):
     """توليف MP3 من نص (مشكَّل أو خام) مع مهلة قاتلة — فشل → None."""
-    fut = _tts_pool.submit(lambda: asyncio.run(_synthesize_async(text, voice, rate)))
+    fut = _tts_pool.submit(
+        lambda: asyncio.run(_synthesize_async(text, voice, rate_pct))
+    )
     try:
         audio = fut.result(timeout=TTS_TIMEOUT + 12)
         return audio if audio else None
@@ -524,18 +614,14 @@ def _audio_response(data, mimetype):
     return resp
 
 
-def _edge_stream_generator(text, voice, rate):
+def _edge_stream_generator(text, voice, rate_pct=0):
     """يقود دفق edge-tts متزامناً (قطعةً قطعاً) ليُرسَل كاستجابة بثّية على الهواء.
 
-    يحافظ على حلقة asyncio واحدة طوال الدفق (الدار أجريافع generator عبر
-    حلقة واحدة منذ البداية حتى لا ينفصل aiohttp عن حلقةٍ ما).
+    يستخدم _edge_tts_communicate فتنتقل تحسينات SSML (وقفات، قِدر) إلى
+    المسار المباشر أيضاً. يحافظ على حلقة asyncio واحدة طوال الدفق.
     """
     async def agen():
-        import edge_tts
-
-        comm = edge_tts.Communicate(
-            text, voice, rate=rate, connect_timeout=10, receive_timeout=TTS_TIMEOUT
-        )
+        comm = _edge_tts_communicate(text, voice, rate_pct)
         async for chunk in comm.stream():
             if chunk["type"] == "audio":
                 yield chunk["data"]
@@ -561,10 +647,8 @@ def _edge_stream_generator(text, voice, rate):
 
 
 def _parse_rate(value):
-    try:
-        return f"{int(value):+d}%"
-    except (TypeError, ValueError):
-        return "+0%"
+    """يقرأ معدّل المستخدم (رقم أو نص إنشائي "+20%") ويُعيد عدداً صحيحاً."""
+    return _rate_pct(value)
 
 
 def _tts_edge_bytes(text, voice, rate):

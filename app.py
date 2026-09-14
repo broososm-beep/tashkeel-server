@@ -27,7 +27,7 @@ Endpoints جديدة (إضافية، اختيارية):
     TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-SA-HamedNeural
     TTS_ENABLED      true|false يعطل/يفعل /tts ، افتراضي true
     TTS_TIMEOUT      مهلة التوليف بالثواني، افتراضي 45
-    GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-2.5-flash (جرب gemini-audio-2.0-preview)
+    GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-3.6-flash (عند عدم دعمه للصوت يُتخطى بكاش سلبي)
     GEMINI_AUDIO_VOICE  صوت Gemini الافتراضي، افتراضي Aoede
     GEMINI_AUDIO_TIMEOUT مهلة توليد صوت Gemini بالثواني، افتراضي 60
     PORT             (يضبطه Render تلقائياً)
@@ -71,7 +71,7 @@ TTS_TIMEOUT = int(float(os.environ.get("TTS_TIMEOUT", "45")))
 
 # ── المحرك الذكي: صوت Gemini الأصلي (responseModalities AUDIO) ──
 GEMINI_AUDIO_MODEL = (
-    os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.5-flash")
+    os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.6-flash")
     .strip()
     .replace("models/", "")
 )
@@ -143,8 +143,10 @@ def is_arabic_text(text):
 def _llm_request(payload):
     """ينفّذ طلباً واحداً لـ Gemini ويعيد dict الرد أو None (مع تفاصيل الخطأ).
 
-    عند استنفاد الحصة (429) يقرأ ثانية واحدة بعد المهلة التي تشير إليها جوجل.
+    عند استنفاد الحصة (429) يقرأ ثانية واحدة بعد المهلة التي تشير إليها جوجل،
+    ثم يُفعّل كولداون للطلبات التالية.
     """
+    global _quota_blocked_until
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -176,6 +178,11 @@ def _llm_request(payload):
             except Exception as exc2:  # noqa: BLE001
                 logger.error("إعادة المحاولة بعد 429 فشلت: %s:%s",
                              type(exc2).__name__, exc2)
+                _quota_blocked_until = time.monotonic() + _quota_cooldown
+                logger.warning(
+                    "حُجِبت استدعاءات LLM لمدة %ds بسبب استنداد الحصة المجانية.",
+                    int(_quota_cooldown),
+                )
                 return None
         return None
     except Exception as exc:  # noqa: BLE001
@@ -187,6 +194,61 @@ def _llm_request(payload):
 _llm_cache = {}
 _llm_cache_lock = threading.Lock()
 _LLM_CACHE_TTL = 600.0
+
+# ── كولداون الحصة المجانية (quota-blocked): حفظ 429 يمنع استدعاءات LLM مؤقتاً ──
+_quota_blocked_until = 0.0
+_quota_cooldown = 3600.0  # ساعة واحدة بعد استنفاد الحصة
+
+# ── كاش LLM على القرص (JSON بسيط، يشحن مع start): ──
+_LLM_DISK_PATH = os.environ.get("LLM_CACHE_PATH", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "llm_cache.json"
+))
+
+
+def _load_disk_cache():
+    """يحمل كاش LLM من القرص عند بدء التشغيل (خيط آمن، يُستدعى مرة واحدة)."""
+    try:
+        with open(_LLM_DISK_PATH, "r", encoding="utf-8") as fh:
+            pairs = json.load(fh)
+        for raw_text, (_, diac) in pairs.items():
+            _llm_cache[raw_text] = (time.monotonic(), diac)
+        logger.info("تم شحن %d مدخلات LLM cache من القرص.", len(_llm_cache))
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, KeyError):
+        pass
+
+
+def _save_disk_cache():
+    """يحفظ الكاش على القرص (مجرد بسيط يُستدعى بانتظار)."""
+    try:
+        now = time.monotonic()
+        with _llm_cache_lock:
+            entries = {t: (v[0], v[1]) for t, v in _llm_cache.items()
+                      if now - v[0] < _LLM_CACHE_TTL}
+        with open(_LLM_DISK_PATH, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, ensure_ascii=False, indent=0)
+    except Exception:
+        logger.debug("تعذّر حفظ كاش LLM على القرص.", exc_info=True)
+
+
+_looks_diacritized_re = re.compile(
+    r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]"
+)
+
+
+def _looks_diacritized(text):
+    """يكشف ما إذا كان النص يحتوي تشكيلًا كافياً (مثلاً أرسله التطبيق بعد تشكيل ONNX)."""
+    words = text.split()
+    if not words:
+        return False
+    marks = len(_looks_diacritized_re.findall(text))
+    return marks >= len(words)
+
+
+def _llm_quota_blocked():
+    """إذا كانت الحصة منتهية، نتخطى Gemini مؤقتاً (ساعة واحدة مثلاً)."""
+    if _quota_blocked_until > time.monotonic():
+        return True
+    return False
 
 
 def _llm_cached(text):
@@ -201,6 +263,11 @@ def _llm_cached(text):
         if len(_llm_cache) > 512:
             _llm_cache.clear()
         _llm_cache[text] = (time.monotonic(), out)
+    # حفظ على القرص عند وجود نتائج جديدة.
+    try:
+        _save_disk_cache()
+    except Exception:
+        pass
     return out
 
 
@@ -225,8 +292,14 @@ def _llm_diacritize_safe(text):
     if not GEMINI_API_KEY:
         logger.info("لا يوجد GEMINI_API_KEY؛ نتخطى المسار السياقي إلى ONNX.")
         return None
+    if _llm_quota_blocked():
+        logger.info("حصة Gemini محجوبة مؤقتاً (429)؛ نتخطى LLM إلى ONNX.")
+        return None
     if len(text) > MAX_LLM_CHARS:
         logger.info("نص فوق %d حرفاً؛ نتخطى LLM إلى ONNX.", MAX_LLM_CHARS)
+        return None
+    if _looks_diacritized(text):
+        logger.debug("نص مشكَّل بالكامل؛ نتخطى LLM (لا تُهدر الحصة).")
         return None
     fut = _llm_pool.submit(_llm_cached, text)
     try:
@@ -250,8 +323,13 @@ def _llm_diacritize_safe(text):
 def context_diacritize(text):
     """سلسلة السقوط الآلي: Gemini→ONNX→النص الخام. لا تعود None أبداً.
 
-    تُرجع (النص المٌشكَّل، اسم المرحلة المستخدمة: llm|onnx|raw).
+    نصٌّ شُكِّل سابقاً (مثل ما يرسله التطبيق بعد تشكيل ONNX) يمرّ كما هو
+    بمرحلة "pass" دون أي استدعاء — يحفظ الحصة المجانية.
+
+    تُرجع (النص المٌشكَّل، اسم المرحلة المستخدمة: llm|onnx|pass|raw).
     """
+    if _looks_diacritized(text):
+        return text, "pass"
     llm_out = _llm_diacritize_safe(text)
     if llm_out:
         return llm_out, "llm"
@@ -315,13 +393,45 @@ def synthesize(text, voice, rate):
 #  المحرك الذكي: صوت Gemini الأصلي + بثّ استجابة مع Range
 # ════════════════════════════════════════════════════════════════
 
+# كاش سلبي لما يفشل صوت Gemini (404/غير مدعوم/مهلة): النموذج يُتجاهل مؤقتاً
+# حتى لا نُهدر محاولتين بصوت فاشل في كل جملة بمحرك gemini.
+_audio_neg_cache = {}
+_audio_neg_lock = threading.Lock()
+_AUDIO_NEG_COOLDOWN = float(os.environ.get("GEMINI_AUDIO_COOLDOWN", "900"))
+
+
+def _audio_model_blocked():
+    """بعد انتهاء كولداون العودة محاولة النموذج الصوتي. يعيد True إن كان محظوراً."""
+    with _audio_neg_lock:
+        until = _audio_neg_cache.get(GEMINI_AUDIO_MODEL, 0.0)
+        if until > time.monotonic():
+            return True
+        if until:
+            _audio_neg_cache.pop(GEMINI_AUDIO_MODEL, None)
+        return False
+
+
+def _block_audio_model(reason):
+    """يسجّل فشل النموذج الصوتي ويمنعه مؤقتاً في الطلبات التالية."""
+    with _audio_neg_lock:
+        _audio_neg_cache[GEMINI_AUDIO_MODEL] = time.monotonic() + _AUDIO_NEG_COOLDOWN
+    logger.warning(
+        "نموذج الصوت %s يتعذّر (%s)؛ يُتخطى محاولات الصوت لـ %is…",
+        GEMINI_AUDIO_MODEL,
+        reason,
+        int(_AUDIO_NEG_COOLDOWN),
+    )
+
 
 def _gemini_audio(text, voice_name):
     """يولّد صوتاً أَمثل من Gemini عبر responseModalities:["AUDIO"].
 
     يعيد (bytes, mimetype) عند النجاح وإلا None (ينسَكب الواجهة إلى Edge).
+    لا يحاول النموذج أثناء الكولداون السلبي بعد فشل سابق.
     """
     if not GEMINI_API_KEY:
+        return None
+    if _audio_model_blocked():
         return None
     payload = {
         "contents": [{"parts": [{"text": text}]}],
@@ -352,6 +462,8 @@ def _gemini_audio(text, voice_name):
         logger.error(
             "Gemini-Audio رفض الطلب (%s) بتفاصيل: %s", exc.code, detail[:1200]
         )
+        if exc.code in (400, 403, 404, 429):
+            _block_audio_model(f"HTTP {exc.code}")
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطأ اتصال بـ Gemini-Audio: %s:%s", type(exc).__name__, exc)
@@ -668,6 +780,10 @@ def tts_gemini_endpoint():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# شحن كاش LLM من القرص عند بدء التشغيل (لا يُهدر الحصة على النصوص المتكررة).
+_load_disk_cache()
 
 
 if __name__ == "__main__":

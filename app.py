@@ -24,10 +24,10 @@ Endpoints جديدة (إضافية، اختيارية):
     GEMINI_MODEL     النموذج، افتراضي gemini-3.6-flash (عند مستخدم جديد 2.5-flash غير متاح — يرجع Google 404)
     GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 25
     GEMINI_MAX_CHARS حدّ أقصى لأحرف نص LLM، فوقه سقوط فوري إلى ONNX، افتراضي 1500
-    TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-SA-HamedNeural
+    TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-EG-ShakirNeural
     TTS_ENABLED      true|false يعطل/يفعل /tts ، افتراضي true
     TTS_TIMEOUT      مهلة التوليف بالثواني، افتراضي 45
-    EDGE_TTS_VOICE   صوت السقوط الآلي لمحرك Edge (تُنقل إليه أصوات Gemini وتحل محلها)، افتراضي ar-SA-HamedNeural
+    EDGE_TTS_VOICE   صوت السقوط الآلي لمحرك Edge (تُنقل إليه أصوات Gemini وتحل محلها)، افتراضي ar-EG-ShakirNeural
     EDGE_PROSOBY_STYLE تفعيل/تعطيل القِدر الأبطأ (-12%) ودرجة الصوت عند نطق Edge (افتراضي true)
     GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-3.6-flash (عند عدم دعمه للصوت يُتخطى بكاش سلبي)
     GEMINI_AUDIO_VOICE  صوت Gemini الافتراضي، افتراضي Aoede
@@ -67,11 +67,11 @@ GEMINI_MODEL = (
 GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
 MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1500"))
 
-TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-SA-HamedNeural").strip()
+TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-EG-ShakirNeural").strip()
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 TTS_TIMEOUT = int(float(os.environ.get("TTS_TIMEOUT", "45")))
 EDGE_FALLBACK_VOICE = (
-    os.environ.get("EDGE_TTS_VOICE", "ar-SA-HamedNeural").strip() or "ar-SA-HamedNeural"
+    os.environ.get("EDGE_TTS_VOICE", "ar-EG-ShakirNeural").strip() or "ar-EG-ShakirNeural"
 )
 EDGE_PROSOBY_STYLE = (
     os.environ.get("EDGE_PROSOBY_STYLE", "true").strip().lower() in ("1", "true", "yes")
@@ -401,7 +401,7 @@ def _ssml_inner(text):
     return safe
 
 
-def _build_ssml(text, voice="ar-SA-HamedNeural", rate_pct=0):
+def _build_ssml(text, voice="ar-EG-ShakirNeural", rate_pct=0):
     """يبني وثيقة SSML كاملة محسّنة (وقفات + قِدر أبطأ قليلاً).
 
     الصيغة: <speak> → <voice> → <prosody> ← نص مهرَّب مع وسوم <break/>.

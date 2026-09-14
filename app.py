@@ -21,7 +21,8 @@ Endpoints جديدة (إضافية، اختيارية):
 بيئة التشغيل (Environment Variables على Render):
     GEMINI_API_KEY   مفتاح Google Gemini (إلزامي للمسار السياقي LLM؛ بدونه LLM=ONNX)
     GEMINI_MODEL     النموذج، افتراضي gemini-3.6-flash (عند مستخدم جديد 2.5-flash غير متاح — يرجع Google 404)
-    GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 12
+    GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 25
+    GEMINI_MAX_CHARS حدّ أقصى لأحرف نص LLM، فوقه سقوط فوري إلى ONNX، افتراضي 1500
     TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-SA-HamedNeural
     TTS_ENABLED      true|false يعطل/يفعل /tts ، افتراضي true
     TTS_TIMEOUT      مهلة التوليف بالثواني، افتراضي 45
@@ -54,8 +55,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = (
     os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip().replace("models/", "")
 )
-GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "12"))
-MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "6000"))
+GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
+MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1500"))
 
 TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-SA-HamedNeural").strip()
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes")

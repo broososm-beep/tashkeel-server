@@ -11,12 +11,13 @@ Endpoints جديدة (إضافية، اختيارية):
         معالجة سياقية كاملة: النص كاملاً يذهب إلى Gemini بنظام-تعليمات صارم (إعراب،
         التقاء ساكنين، ضرورات شعرية). عند غياب المفتاح/المهلة/الفشل → سقوط آلي إلى
         محرك ONNX المحلي ثم إلى النص الخام. لن يتوقف أبداً.
-    POST /ssml  {"text": "...", "voice": "..."}           → {"ssml": "<speak>...</speak>", "engine": "..."} (200)
-        يُرجع فقط وثيقة SSML (لكل عميل يدعمها).
-    POST /tts  {"text": "...", "voice": "...", "rate": 0} → ملف audio/mpeg (MP3)
-        خط أنابيب كامل: تشكيل سياقي (بالسقوط الآلي) ثم نطق عبر محرك مايكروسوفت
-        (edge-tts / Edge Neural). إن تأخر أو فشل التشكيل يُنطَق النص الخام —
-        لا يتوقف التطبيق أبداً. header X-Tashkeel-Engine يوضح المرحلة المستخدمة.
+    POST /tts-gemini  {"text": "...", "voice_name": "Aoede", "rate": 0} → صوت (audio/wav|audio/mpeg)
+        المحرك الذكي: تشكيل سياقي (بالسقوط الآلي) ثم صوت Gemini الأصلي عبر
+        responseModalities=["AUDIO"] + speechConfig.voiceName (Aoede/Charon/Fenrir/Kore/Puck).
+        الاستجابة بثّية (StreamingResponse) مع دعم Range (206) لفكّ TextStream لدى
+        مشغّل Flutter والترجيع/التقديم بأمان. إن لم يكن مفتاحك يدعم نموذجاً صوتياً
+        ينزل آلياً إلى دفق Edge (نفس /tts) دون كسر. header X-Tashkeel-Engine =
+        gemini-audio|edge و X-Tashkeel-Diacrit = llm|onnx|raw.
 
 بيئة التشغيل (Environment Variables على Render):
     GEMINI_API_KEY   مفتاح Google Gemini (إلزامي للمسار السياقي LLM؛ بدونه LLM=ONNX)
@@ -26,13 +27,19 @@ Endpoints جديدة (إضافية، اختيارية):
     TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-SA-HamedNeural
     TTS_ENABLED      true|false يعطل/يفعل /tts ، افتراضي true
     TTS_TIMEOUT      مهلة التوليف بالثواني، افتراضي 45
+    GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-2.5-flash (جرب gemini-audio-2.0-preview)
+    GEMINI_AUDIO_VOICE  صوت Gemini الافتراضي، افتراضي Aoede
+    GEMINI_AUDIO_TIMEOUT مهلة توليد صوت Gemini بالثواني، افتراضي 60
     PORT             (يضبطه Render تلقائياً)
 """
 import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -61,6 +68,17 @@ MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1500"))
 TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-SA-HamedNeural").strip()
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 TTS_TIMEOUT = int(float(os.environ.get("TTS_TIMEOUT", "45")))
+
+# ── المحرك الذكي: صوت Gemini الأصلي (responseModalities AUDIO) ──
+GEMINI_AUDIO_MODEL = (
+    os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.5-flash")
+    .strip()
+    .replace("models/", "")
+)
+GEMINI_AUDIO_VOICE = os.environ.get("GEMINI_AUDIO_VOICE", "Aoede").strip()
+GEMINI_AUDIO_TIMEOUT = float(os.environ.get("GEMINI_AUDIO_TIMEOUT", "60"))
+# أصوات Gemini المدعومة رسمياً (للتحقق/التوثيق فقط؛ أي اسم يمرره جوجل يقبلها).
+GEMINI_VOICES = {"Aoede", "Charon", "Fenrir", "Kore", "Puck"}
 
 # تعليمات صارمة للمعالجة السياقية (System Prompt معتمد في الطلب إلى Gemini).
 GEMINI_SYSTEM_PROMPT = (
@@ -122,13 +140,11 @@ def is_arabic_text(text):
 # ════════════════════════════════════════════════════════════════
 
 
-def _llm_diacritize(text):
-    """استدعاء Gemini عبر REST (stdlib — بلا حزمة ثقيلة) وإرجاع النص المشكَّل."""
-    payload = {
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
-        "contents": [{"parts": [{"text": text}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
-    }
+def _llm_request(payload):
+    """ينفّذ طلباً واحداً لـ Gemini ويعيد dict الرد أو None (مع تفاصيل الخطأ).
+
+    عند استنفاد الحصة (429) يقرأ ثانية واحدة بعد المهلة التي تشير إليها جوجل.
+    """
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -141,7 +157,7 @@ def _llm_diacritize(text):
     )
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         logger.error(
@@ -149,9 +165,54 @@ def _llm_diacritize(text):
             exc.code,
             detail[:3000],
         )
+        if exc.code == 429:
+            m = re.search(r"retry in (\d+(?:\.\d+)?)s", detail or "", re.I)
+            delay = min(float(m.group(1)), 8.0) if m else 2.0
+            logger.warning("استنفدت الحصة المجانية؛ إعادة المحاولة بعد %.1fs.", delay)
+            time.sleep(delay)
+            try:
+                with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as exc2:  # noqa: BLE001
+                logger.error("إعادة المحاولة بعد 429 فشلت: %s:%s",
+                             type(exc2).__name__, exc2)
+                return None
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطأ اتصال بـ Gemini: %s:%s", type(exc).__name__, exc)
+        return None
+
+
+# تجميع نصوص متشابهة متكررة (التطبيق يطلب النص نفسه لاحقاً): ذاكرة مؤقتة بحدّ زمني.
+_llm_cache = {}
+_llm_cache_lock = threading.Lock()
+_LLM_CACHE_TTL = 600.0
+
+
+def _llm_cached(text):
+    """LLM مع ذاكرة مؤقتة قصيرة لتفادي ضغط الحصة المجانية عند طلبات متطابقة."""
+    now = time.monotonic()
+    with _llm_cache_lock:
+        hit = _llm_cache.get(text)
+        if hit and now - hit[0] < _LLM_CACHE_TTL:
+            return hit[1]
+    out = _llm_diacritize(text)
+    with _llm_cache_lock:
+        if len(_llm_cache) > 512:
+            _llm_cache.clear()
+        _llm_cache[text] = (time.monotonic(), out)
+    return out
+
+
+def _llm_diacritize(text):
+    """استدعاء Gemini عبر REST (stdlib — بلا حزمة ثقيلة) وإرجاع النص المشكَّل."""
+    payload = {
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+    }
+    data = _llm_request(payload)
+    if not data:
         return None
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -167,7 +228,7 @@ def _llm_diacritize_safe(text):
     if len(text) > MAX_LLM_CHARS:
         logger.info("نص فوق %d حرفاً؛ نتخطى LLM إلى ONNX.", MAX_LLM_CHARS)
         return None
-    fut = _llm_pool.submit(_llm_diacritize, text)
+    fut = _llm_pool.submit(_llm_cached, text)
     try:
         out = fut.result(timeout=GEMINI_TIMEOUT + 8)
     except TimeoutError:
@@ -248,6 +309,219 @@ def synthesize(text, voice, rate):
     except Exception as exc:  # noqa: BLE001
         logger.error("فشل النطق: %s:%s", type(exc).__name__, exc)
         return None
+
+
+# ════════════════════════════════════════════════════════════════
+#  المحرك الذكي: صوت Gemini الأصلي + بثّ استجابة مع Range
+# ════════════════════════════════════════════════════════════════
+
+
+def _gemini_audio(text, voice_name):
+    """يولّد صوتاً أَمثل من Gemini عبر responseModalities:["AUDIO"].
+
+    يعيد (bytes, mimetype) عند النجاح وإلا None (ينسَكب الواجهة إلى Edge).
+    """
+    if not GEMINI_API_KEY:
+        return None
+    payload = {
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice_name}
+                }
+            },
+        },
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_AUDIO_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_AUDIO_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.error(
+            "Gemini-Audio رفض الطلب (%s) بتفاصيل: %s", exc.code, detail[:1200]
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطأ اتصال بـ Gemini-Audio: %s:%s", type(exc).__name__, exc)
+        return None
+    try:
+        part = data["candidates"][0]["content"]["parts"][0]
+        return base64.b64decode(part["inlineData"]["data"]), part["inlineData"]["mimeType"]
+    except (KeyError, IndexError, TypeError):
+        logger.error("استجابة Gemini-Audio بلا inlineData: %s",
+                     json.dumps(data, ensure_ascii=False)[:400])
+        return None
+
+
+def _parse_range_header(raw, size):
+    """يحلل Range: bytes=start-end | start- | -suffix ويعيد (start, end) أو None."""
+    if not raw:
+        return None
+    m = re.match(r"bytes=(\d*)-(\d*)", raw.strip())
+    if not m:
+        return None
+    start_s, end_s = m.group(1), m.group(2)
+    if start_s == "" and end_s == "":
+        return None
+    if start_s == "":
+        start = max(0, size - int(end_s))
+        end = size - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else size - 1
+        if start >= size:
+            start = size
+    end = min(end, size - 1)
+    if start > end:
+        return None
+    return (start, end)
+
+
+def _chunks(data, size=32768):
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
+
+
+def _audio_response(data, mimetype):
+    """استجابة صوت بثّية مع دعم Range (206) — ليمكّن مشغّل Flutter من
+    الترجيع/التقديم بأمان داخل ما تحمَّل (Buffered) حتى قبل اكتمال التنزيل."""
+    length = len(data)
+    headers = {"Accept-Ranges": "bytes"}
+    rng = _parse_range_header(request.headers.get("Range"), length)
+    if rng:
+        start, end = rng
+        part = data[start:end + 1]
+        headers["Content-Range"] = f"bytes {start}-{end}/{length}"
+        resp = Response(_chunks(part), status=206, mimetype=mimetype, headers=headers)
+        resp.headers["Content-Length"] = str(len(part))
+        return resp
+    resp = Response(_chunks(data), mimetype=mimetype, headers=headers)
+    resp.headers["Content-Length"] = str(length)
+    return resp
+
+
+def _edge_stream_generator(text, voice, rate):
+    """يقود دفق edge-tts متزامناً (قطعةً قطعاً) ليُرسَل كاستجابة بثّية على الهواء.
+
+    يحافظ على حلقة asyncio واحدة طوال الدفق (الدار أجريافع generator عبر
+    حلقة واحدة منذ البداية حتى لا ينفصل aiohttp عن حلقةٍ ما).
+    """
+    async def agen():
+        import edge_tts
+
+        comm = edge_tts.Communicate(
+            text, voice, rate=rate, connect_timeout=10, receive_timeout=TTS_TIMEOUT
+        )
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                yield chunk["data"]
+
+    ag = agen()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        while True:
+            try:
+                piece = loop.run_until_complete(ag.__anext__())
+            except StopAsyncIteration:
+                break
+            yield piece
+    except Exception as exc:  # noqa: BLE001
+        logger.error("فشل دفق Edge الصوتي: %s:%s", type(exc).__name__, exc)
+    finally:
+        try:
+            loop.run_until_complete(ag.aclose())
+        except Exception:  # noqa: BLE001
+            pass
+        loop.close()
+
+
+def _parse_rate(value):
+    try:
+        return f"{int(value):+d}%"
+    except (TypeError, ValueError):
+        return "+0%"
+
+
+def _tts_edge_bytes(text, voice, rate):
+    """مسار Edge الكلاسيكي (تشكيل + نطق) ويعيد (بايتات، المحرك النهائي)."""
+    result, diac_engine = context_diacritize(text)
+    audio = synthesize(result, voice, rate)
+    final_engine = diac_engine
+    if audio is None:
+        final_engine = "raw"
+        audio = synthesize(text, voice, rate)
+    return audio, final_engine
+
+
+@app.route("/audio/tts", methods=["GET"])
+def audio_tts_get():
+    """نفس /tts لكن عبر GET — للبث المباشر لدى just_audio/ExoPlayer مع Range (206)."""
+    if not TTS_ENABLED:
+        return jsonify({"error": "tts disabled"}), 404
+    text = (request.args.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty text"}), 400
+    voice = (request.args.get("voice") or TTS_VOICE).strip()
+    rate = _parse_rate(request.args.get("rate", "0"))
+    audio, engine = _tts_edge_bytes(text, voice, rate)
+    if audio is None:
+        return jsonify({"error": "tts synthesis failed"}), 500
+    resp = _audio_response(audio, "audio/mpeg")
+    resp.headers["X-Tashkeel-Engine"] = engine
+    resp.headers["X-Tashkeel-Diacrit"] = engine
+    resp.headers["X-Voice"] = voice
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/audio/tts-gemini", methods=["GET"])
+def audio_tts_gemini_get():
+    """المحرك الذكي عبر GET — للبث المباشر مع Range إن كان صوت Gemini جاهزًا،
+    وإلا دفق Edge (chunked) — لا يتوقف أبداً."""
+    if not TTS_ENABLED:
+        return jsonify({"error": "tts disabled"}), 404
+    text = (request.args.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty text"}), 400
+    voice = (request.args.get("voice_name") or GEMINI_AUDIO_VOICE).strip()
+    rate = _parse_rate(request.args.get("rate", "0"))
+
+    result, diac_engine = context_diacritize(text)
+    audio_mime = _gemini_audio(result, voice)
+    if audio_mime is not None:
+        audio, mime = audio_mime
+        resp = _audio_response(audio, mime)
+        resp.headers["X-Tashkeel-Engine"] = "gemini-audio"
+        resp.headers["X-Tashkeel-Diacrit"] = diac_engine
+        resp.headers["X-Voice"] = voice
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    generator = _edge_stream_generator(result, TTS_VOICE, rate)
+    resp = Response(
+        generator,
+        mimetype="audio/mpeg",
+        headers={
+            "X-Tashkeel-Engine": "edge",
+            "X-Tashkeel-Diacrit": diac_engine,
+            "X-Voice": TTS_VOICE,
+            "Cache-Control": "no-store",
+        },
+    )
+    return resp
 
 
 # ════════════════════════════════════════════════════════════════
@@ -339,6 +613,56 @@ def tts_endpoint():
             "Cache-Control": "no-store",
         },
     )
+
+
+@app.route("/tts-gemini", methods=["POST"])
+def tts_gemini_endpoint():
+    """المحرك الذكي: تشكيل سياقي ← صوت Gemini الأصلي (AUDIO) — بثّ مع Range.
+
+    body: {"text": "...", "voice_name": "Aoede|Charon|Fenrir|Kore|Puck", "rate": 0}
+    عند فشل/غياب صوت Gemini ← سقوط آلي إلى دفق Edge (نفس جودة /tts). لا يتوقف أبداً.
+    الرؤوس: X-Tashkeel-Engine = gemini-audio|edge ، X-Tashkeel-Diacrit ، X-Voice.
+    """
+    if not TTS_ENABLED:
+        return jsonify({"error": "tts disabled"}), 404
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty text"}), 400
+    voice = (data.get("voice_name") or GEMINI_AUDIO_VOICE).strip()
+    try:
+        rate = f"{int(data.get('rate', 0)):+d}%"
+    except (TypeError, ValueError):
+        rate = "+0%"
+
+    # 1) تشكيل سياقي (نص كامل) مع سقوط آلي حتى الخام.
+    result, diac_engine = context_diacritize(text)
+
+    # 2) جرّب صوت Gemini الأصلي (نموذج صوتي إن كان مفعّلاً لمفتاحك).
+    audio_mime = _gemini_audio(result, voice)
+    if audio_mime is not None:
+        audio, mime = audio_mime
+        resp = _audio_response(audio, mime)
+        resp.headers["X-Tashkeel-Engine"] = "gemini-audio"
+        resp.headers["X-Tashkeel-Diacrit"] = diac_engine
+        resp.headers["X-Voice"] = voice
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    # 3) سقوط آلي: دفق Edge من النص المشكَّل (ثم الخام إن تعثر الدفق).
+    logger.warning("صوت Gemini غير متاح؛ نُستخدم محرك Edge.")
+    generator = _edge_stream_generator(result, TTS_VOICE, rate)
+    resp = Response(
+        generator,
+        mimetype="audio/mpeg",
+        headers={
+            "X-Tashkeel-Engine": "edge",
+            "X-Tashkeel-Diacrit": diac_engine,
+            "X-Voice": TTS_VOICE,
+            "Cache-Control": "no-store",
+        },
+    )
+    return resp
 
 
 @app.route("/health", methods=["GET"])

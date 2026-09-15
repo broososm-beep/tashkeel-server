@@ -29,6 +29,18 @@ Endpoints جديدة (إضافية، اختيارية):
     TTS_TIMEOUT      مهلة التوليف بالثواني، افتراضي 45
     EDGE_TTS_VOICE   صوت السقوط الآلي لمحرك Edge (تُنقل إليه أصوات Gemini وتحل محلها)، افتراضي ar-EG-ShakirNeural
     EDGE_PROSOBY_STYLE تفعيل/تعطيل القِدر الأبطأ (-12%) ودرجة الصوت عند نطق Edge (افتراضي true)
+    AZURE_TTS_KEY      مفتاح Azure Speech — F0 500K حرف/شهر مجاني دائم (سيرفر-محض)
+    AZURE_REGION       منطقة Azure (مثال: eastus) — تُبنى منه الترويسة والرابط
+    AZURE_TTS_VOICE    صوت Azure، افتراضي ar-EG-ShakirNeural (ذكور)
+    AZURE_MAX_CHARS    حدّ أقصى لنص Azure لكل طلب، افتراضي 4000
+    AZURE_TIMEOUT      مهلة استدعاء Azure بالثواني، افتراضي 40
+    AZURE_COOLDOWN     كولداون السقوط بعد فشل Azure (ثوانٍ)، افتراضي 900
+    CARTESIA_API_KEY   مفتاح Cartesia Sonic — 20K حرف/شهر مجاني متجدد (سيرفر-محض)
+    CARTESIA_VOICE_ID  معرّف صوت عربي ذكور (يُجلب تلقائياً من القائمة إن تُرك فارغاً)
+    CARTESIA_MAX_CHARS حدّ أقصى لنص Cartesia لكل طلب، افتراضي 2000
+    CARTESIA_TIMEOUT   مهلة Cartesia بالثواني، افتراضي 30
+    CARTESIA_COOLDOWN  كولداون السقوط بعد فشل Cartesia (ثوانٍ)، افتراضي 900
+    TTS_ENGINE         auto (سلم Cartesia→Azure→Edge) | cartesia | azure | edge
     GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-3.6-flash (عند عدم دعمه للصوت يُتخطى بكاش سلبي)
     GEMINI_AUDIO_VOICE  صوت Gemini الافتراضي، افتراضي Aoede
     GEMINI_AUDIO_TIMEOUT مهلة توليد صوت Gemini بالثواني، افتراضي 60
@@ -76,6 +88,120 @@ EDGE_FALLBACK_VOICE = (
 EDGE_PROSOBY_STYLE = (
     os.environ.get("EDGE_PROSOBY_STYLE", "true").strip().lower() in ("1", "true", "yes")
 )
+
+# ── محركات الصوت الإضافية (حصص مجانية متجددة شهرية) ─────────────────────────
+# Azure Speech F0 (500K حرف/شهر — دائم) + Cartesia Sonic 3.6 (20K حرف/شهر).
+# المفاتيح سيرفر-محض عبر envs Render فقط؛ لا تُرسل للموّبايل ولا تُسجَّل.
+AZURE_TTS_KEY = os.environ.get("AZURE_TTS_KEY", "").strip()
+AZURE_REGION = os.environ.get("AZURE_REGION", "").strip().lower()
+AZURE_TTS_VOICE = os.environ.get("AZURE_TTS_VOICE", "ar-EG-ShakirNeural").strip()
+AZURE_MAX_CHARS = int(float(os.environ.get("AZURE_MAX_CHARS", "4000")))
+AZURE_TIMEOUT = float(os.environ.get("AZURE_TIMEOUT", "40"))
+AZURE_COOLDOWN = float(os.environ.get("AZURE_COOLDOWN", "900"))
+
+CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY", "").strip()
+CARTESIA_VOICE_ID = os.environ.get("CARTESIA_VOICE_ID", "").strip()
+CARTESIA_MAX_CHARS = int(float(os.environ.get("CARTESIA_MAX_CHARS", "2000")))
+CARTESIA_TIMEOUT = float(os.environ.get("CARTESIA_TIMEOUT", "30"))
+CARTESIA_COOLDOWN = float(os.environ.get("CARTESIA_COOLDOWN", "900"))
+
+# TTS_ENGINE: auto (السلم الكامل cartesia→azure→edge) | cartesia | azure | edge.
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "auto").strip().lower()
+
+# حصص الشهر (نسبة التوقف الناعم 95% — عدّاد احترازي للسيرفر لا عدّاد فاتورة).
+_ENGINE_QUOTAS = {"cartesia": 20000, "azure": 500000}
+_ENGINE_SOFT_STOP_RATIO = 0.95
+
+# ── برادع الأسرار من السجلات (أمان المفاتيح) ─────────────────────────────────
+class _SecretRedactor(logging.Filter):
+    """يحجب أي شكل مفتاح قبل كتابة السجل: لا تظهر المفاتيح في أي مكان."""
+
+    _PATS = (
+        re.compile(r"sk_car_[A-Za-z0-9_.\-]+", re.I),
+        re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+        re.compile(r"x-goog-api-key\s*[:=]\s*\S+", re.I),
+        re.compile(r"ocp-apim-subscription-key\s*[:=]\s*\S+", re.I),
+        re.compile(r"xi-api-key\s*[:=]\s*\S+", re.I),
+        re.compile(r"authorization\s*[:=]\s*bearer\s+\S+", re.I),
+    )
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            for pat in self._PATS:
+                msg = pat.sub("[REDACTED]", msg)
+            record.msg = msg
+            record.args = ()
+        except Exception:  # noqa: BLE001 — البرادع لا يكسر التسجيل أبداً.
+            pass
+        return True
+
+
+logger.addFilter(_SecretRedactor())
+
+# ── حالات المحركات: كولداون سلبي + عداد حصص شهري (خيط آمن) ───────────────────
+_engine_down_until = {}
+_engine_down_lock = threading.Lock()
+_engine_budget = {}
+_engine_budget_lock = threading.Lock()
+
+
+def _engine_blocked(name):
+    """يعيد True إن كان المحرك في كولداون سلبي بعد فشل."""
+    with _engine_down_lock:
+        until = _engine_down_until.get(name, 0.0)
+        if until > time.monotonic():
+            return True
+        if until:
+            _engine_down_until.pop(name, None)
+    return False
+
+
+def _block_engine(name, reason):
+    """يُدخل المحرك كولداوناً سلبياً (لا تُهدر المهل على محرك ميت)."""
+    cooldown = CARTESIA_COOLDOWN if name == "cartesia" else AZURE_COOLDOWN
+    with _engine_down_lock:
+        _engine_down_until[name] = time.monotonic() + cooldown
+    logger.warning("محرك %s متعذّر (%s)؛ يُتخطى لـ %ds.", name, reason, int(cooldown))
+
+
+def _engine_budget_state(name):
+    """(مستعمل، حصة، نسبة، شهر) — يُصفّر عداد الشهر تلقائياً عند تجدده."""
+    month = time.strftime("%Y-%m")
+    quota = _ENGINE_QUOTAS.get(name)
+    if quota is None:
+        return 0, None, 0.0, month
+    with _engine_budget_lock:
+        rec = _engine_budget.get(name)
+        if not rec or rec["month"] != month:
+            rec = {"month": month, "chars": 0}
+            _engine_budget[name] = rec
+        used = rec["chars"]
+    return used, quota, used / quota, month
+
+
+def _engine_soft_stopped(name):
+    """التوقف الناعم: المحرك يُقصى لباقي الشهر عند 95% من حصته."""
+    _, quota, pct, _ = _engine_budget_state(name)
+    return quota is not None and pct >= _ENGINE_SOFT_STOP_RATIO
+
+
+def _engine_charge(name, chars):
+    """يحسب حروفاً مستهلكة من حصة المحرك (ناجحة فقط)."""
+    with _engine_budget_lock:
+        rec = _engine_budget.get(name)
+        if rec and rec["month"] == time.strftime("%Y-%m"):
+            rec["chars"] += max(0, int(chars))
+
+
+_TASHKEEL_MARKS_RE = re.compile(
+    r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]"
+)
+
+
+def _strip_tashkeel(text):
+    """يجرد علامات التشكيل لخفض الحروف المفوترة لدى المحركات ذات الحصص (15–30%)."""
+    return _TASHKEEL_MARKS_RE.sub("", text or "")
 
 # ── المحرك الذكي: صوت Gemini الأصلي (responseModalities AUDIO) ──
 GEMINI_AUDIO_MODEL = (
@@ -157,12 +283,15 @@ def _llm_request(payload):
     global _quota_blocked_until
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        f"{GEMINI_MODEL}:generateContent"
     )
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
         method="POST",
     )
     try:
@@ -588,12 +717,15 @@ def _gemini_audio(text, voice_name):
     }
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_AUDIO_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        f"{GEMINI_AUDIO_MODEL}:generateContent"
     )
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
         method="POST",
     )
     try:
@@ -695,33 +827,230 @@ def _parse_rate(value):
     return _rate_pct(value)
 
 
-def _tts_edge_bytes(text, voice, rate):
-    """مسار Edge الكلاسيكي (تشكيل + نطق) ويعيد (بايتات، المحرك، الصوت الفعلي).
+def _azure_enabled():
+    """Azure محرّك متاح فقط إن وُجد المفتاح والمنطقة (سيرفر-محض) مع اسم منطقة آمن."""
+    return bool(AZURE_TTS_KEY and AZURE_REGION) and (
+        re.fullmatch(r"[a-z0-9-]+", AZURE_REGION) is not None
+    )
 
-    الصوت المرتجَع صالحٌ دائماً لمحرك Edge (Voice funnel).
+
+def _azure_ssml(text, voice, rate_pct):
+    """SSML خفيف لـ Azure: وقفات الفواصل/الأسطر، وprosody عند معدل غير صفري فقط."""
+    inner = _ssml_inner(text)
+    if rate_pct:
+        return (
+            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            f'xml:lang="ar-SA"><voice name="{voice}">'
+            f'<prosody rate="{rate_pct:+d}%">{inner}</prosody>'
+            f"</voice></speak>"
+        )
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        f'xml:lang="ar-SA"><voice name="{voice}">{inner}</voice></speak>'
+    )
+
+
+def _azure_tts_bytes(text, rate_pct):
+    """يولّف عبر Azure Speech REST (بلا SDK ثقيل) ويعيد MP3 bytes أو None.
+
+    أي خطأ يُدخل المحرك كولداوناً سلبياً (لا تُهدر مهل ناجية مع محرك ميت).
+    العداد الشهري يُشحن فقط بعد نجاح فعلي (F0 لا يُفوَّر أبداً).
     """
+    if not _azure_enabled() or _engine_soft_stopped("azure") or _engine_blocked("azure"):
+        return None
+    if len(text) > AZURE_MAX_CHARS:
+        logger.info("نص فوق %d حرفاً؛ نتجاوز Azure إلى Edge.", AZURE_MAX_CHARS)
+        return None
+    voice = AZURE_TTS_VOICE
+    ssml = _azure_ssml(text, voice, rate_pct)
+    req = urllib.request.Request(
+        f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
+        data=ssml.encode("utf-8"),
+        headers={
+            "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=AZURE_TIMEOUT) as resp:
+            audio = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.error("Azure رفض الطلب (HTTP %s) — %s", exc.code, detail[:600])
+        if exc.code in (400, 401, 403, 429):
+            _block_engine("azure", f"HTTP {exc.code}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطأ اتصال بـ Azure: %s:%s", type(exc).__name__, exc)
+        _block_engine("azure", type(exc).__name__)
+        return None
+    if not _looks_like_mp3(audio):
+        logger.error("Azure استجابة ليست MP3 صالحة: %d بايت.", len(audio))
+        _block_engine("azure", "bad mp3")
+        return None
+    _engine_charge("azure", len(_strip_tashkeel(text)))
+    return audio
+
+
+_cartesia_voice_resolved = None
+_cartesia_voice_lock = threading.Lock()
+
+
+def _cartesia_voice_id():
+    """يعيد معرّف صوت Cartesia: CARTESIA_VOICE_ID مباشرة، أو (مرة واحدة) جلب
+    قائمة الأصوات العربية واختيار صوت ذكور. لا يُعاد الجلب إلا عند غياب المفتاح."""
+    global _cartesia_voice_resolved
+    if CARTESIA_VOICE_ID:
+        return CARTESIA_VOICE_ID
+    if _cartesia_voice_resolved:
+        return _cartesia_voice_resolved
+    if not CARTESIA_API_KEY:
+        return None
+    with _cartesia_voice_lock:
+        if _cartesia_voice_resolved:
+            return _cartesia_voice_resolved
+        picked = None
+        try:
+            req = urllib.request.Request(
+                "https://api.cartesia.ai/voices?language=ar",
+                headers={
+                    "X-API-Key": CARTESIA_API_KEY,
+                    "Authorization": f"Bearer {CARTESIA_API_KEY}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            voices = list((data or {}).get("voices") or [])
+            for v in voices:
+                gender = str(v.get("gender") or v.get("sex") or "").lower()
+                if gender and gender != "female":
+                    picked = v.get("id")
+                    break
+            if not picked:
+                picked = voices[0].get("id") if voices else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("تعذّر جلب أصوات Cartesia (%s:%s)؛ يُتخطى المحرك.",
+                           type(exc).__name__, exc)
+        _cartesia_voice_resolved = picked
+        if picked:
+            logger.info("Cartesia: صوت عربي تلقائي %s.", picked)
+        return picked
+
+
+def _cartesia_tts_bytes(text, rate_pct):
+    """يولّف عبر Cartesia Sonic (الاستجابة ~17ms) ويعيد MP3 bytes أو None.
+
+    النص يُجرَّد من علامات التشكيل (حروف مُفوترة أقل). أي خطأ يُدخل كولداوناً.
+    """
+    if not CARTESIA_API_KEY or _engine_soft_stopped("cartesia") or _engine_blocked("cartesia"):
+        return None
+    voice_id = _cartesia_voice_id()
+    if not voice_id:
+        logger.info("لا يوجد صوت Cartesia معرّف؛ نتجاوزه إلى Azure.")
+        return None
+    if len(text) > CARTESIA_MAX_CHARS:
+        logger.info("نص فوق %d حرفاً؛ نتجاوز Cartesia إلى Azure/Edge.", CARTESIA_MAX_CHARS)
+        return None
+    payload = {
+        "model_id": "sonic-3.6",
+        "transcript": text,
+        "voice": {"id": voice_id},
+        "language": "ar",
+        "output_format": {"container": "mp3", "sample_rate": 24000, "bit_rate": 96000},
+    }
+    if rate_pct:
+        speed = min(1.5, max(0.6, 1.0 + rate_pct / 100.0))
+        payload["generation_config"] = {"speed": speed}
+    req = urllib.request.Request(
+        "https://api.cartesia.ai/tts/bytes",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "X-API-Key": CARTESIA_API_KEY,
+            "Authorization": f"Bearer {CARTESIA_API_KEY}",
+            "Cartesia-Version": "2026-08-14",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CARTESIA_TIMEOUT) as resp:
+            audio = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.error("Cartesia رفض الطلب (HTTP %s) — %s", exc.code, detail[:600])
+        if exc.code in (400, 401, 403, 404, 429):
+            _block_engine("cartesia", f"HTTP {exc.code}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطأ اتصال بـ Cartesia: %s:%s", type(exc).__name__, exc)
+        _block_engine("cartesia", type(exc).__name__)
+        return None
+    if not _looks_like_mp3(audio):
+        logger.error("Cartesia استجابة ليست MP3 صالحة: %d بايت.", len(audio))
+        _block_engine("cartesia", "bad mp3")
+        return None
+    _engine_charge("cartesia", len(text))
+    return audio
+
+
+def _synth_ladder(text, voice, rate):
+    """سلم المحركات: تشكيل واحد ← Cartesia→Azure→Edge (حسب TTS_ENGINE).
+
+    يعيد (audio|None, engine: cartesia|azure|edge, voice_used, diac_engine).
+    قواعد:
+      • محركات الحصّة (Cartesia/Azure) تُفوَّر بنصٍّ مجرَّد من التشكيل
+        (حروف مُفوترة أقل)؛ إعادة المُشكَّل حصراً للسقوط الأخير (Edge).
+      • TTS_ENGINE يقيّد خيارات الحصّة فقط؛ Edge يبقى الملاذ الأخير دائماً
+        (نطق مشكَّل ثم خام) — لا يتوقف مطلقاً، ويرفع أي صوت محترم بتفجيعات.
+    """
+    preferred = TTS_ENGINE if TTS_ENGINE != "auto" else None
+    candidates = ["cartesia", "azure"] if preferred is None else ([preferred] if preferred in (
+        "cartesia", "azure") else [])
     result, diac_engine = context_diacritize(text)
-    audio, voice_used = _edge_fallback_bytes(result, text, rate, voice)
-    final_engine = diac_engine if audio is not None else "raw"
-    return audio, final_engine, voice_used
+    stripped = _strip_tashkeel(result)
+
+    for name in candidates:
+        if name == "cartesia":
+            audio = _cartesia_tts_bytes(stripped, rate)
+            if audio is not None:
+                return audio, "cartesia", _cartesia_voice_id() or "cartesia:auto", diac_engine
+        else:
+            audio = _azure_tts_bytes(stripped, rate)
+            if audio is not None:
+                return audio, "azure", AZURE_TTS_VOICE, diac_engine
+
+    voice_used = _edge_voice(voice)
+    audio = synthesize(result, voice_used, rate)
+    engine = diac_engine
+    if audio is None:
+        logger.warning("تأخر/فشل نطق النص المشكَّل عبر Edge؛ ننطق النص الخام.")
+        audio = synthesize(text, voice_used, rate)
+        engine = "raw"
+    return audio, "edge", voice_used, engine
 
 
 @app.route("/audio/tts", methods=["GET"])
 def audio_tts_get():
-    """نفس /tts لكن عبر GET — للبث المباشر لدى just_audio/ExoPlayer مع Range (206)."""
+    """نفس /tts لكن عبر GET — للبث المباشر لدى just_audio/ExoPlayer مع Range (206).
+
+    السلم الكامل (TTS_ENGINE): Cartesia→Azure→Edge، بنفس انضباط /tts.
+    الرؤوس: X-Tashkeel-Engine = cartesia|azure|edge ، X-Tashkeel-Diacrit ، X-Voice.
+    """
     if not TTS_ENABLED:
         return jsonify({"error": "tts disabled"}), 404
     text = (request.args.get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty text"}), 400
-    voice = _edge_voice(request.args.get("voice") or TTS_VOICE)
+    voice = request.args.get("voice") or TTS_VOICE
     rate = _parse_rate(request.args.get("rate", "0"))
-    audio, engine, voice_used = _tts_edge_bytes(text, voice, rate)
+    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate)
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
     resp = _audio_response(audio, "audio/mpeg")
     resp.headers["X-Tashkeel-Engine"] = engine
-    resp.headers["X-Tashkeel-Diacrit"] = engine
+    resp.headers["X-Tashkeel-Diacrit"] = diac_engine
     resp.headers["X-Voice"] = voice_used
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -812,10 +1141,12 @@ def ssml_endpoint():
 
 @app.route("/tts", methods=["POST"])
 def tts_endpoint():
-    """خط أنابيب كامل: تشكيل سياقي → SSML → نطق Microsoft → MP3.
+    """خط أنابيب كامل: تشكيل سياقي → سلم المحركات Cartesia→Azure→Edge.
 
-    السقوط الآلي: إن تأخر أو فشل التشكيل يُنطَق النص الخام، فلا يتوقف التطبيق.
-    الرؤوس: X-Tashkeel-Engine = llm|onnx|raw ، X-Voice المستخدم.
+    السقوط الآلي: أي محرك حصّة فاشل يُتخطى؛ وEdge ناطق النص المشكَّل ثم الخام —
+    فلا يتوقف التطبيق.
+    الرؤوس: X-Tashkeel-Engine = cartesia|azure|edge ، X-Tashkeel-Diacrit = llm|onnx|raw ،
+    X-Voice المستخدم الفعلي.
     """
     if not TTS_ENABLED:
         return jsonify({"error": "tts disabled"}), 404
@@ -823,22 +1154,10 @@ def tts_endpoint():
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty text"}), 400
-    voice = _edge_voice(data.get("voice") or TTS_VOICE)
-    try:
-        rate = f"{int(data.get('rate', 0)):+d}%"
-    except (TypeError, ValueError):
-        rate = "+0%"
+    voice = data.get("voice") or TTS_VOICE
+    rate = _parse_rate(data.get("rate", "0"))
 
-    # 1) تشكيل سياقي (نص كامل) مع سقوط آلي حتى الخام.
-    result, engine = context_diacritize(text)
-
-    # 2) توليف الصوت من النص المشكَّل.
-    audio = synthesize(result, voice, rate)
-    if audio is None:
-        # 3) fallback نهائي: النص الخام كما هو (ضمان عدم التوقف).
-        logger.warning("تأخر/فشل نطق النص المشكَّل؛ ننطق النص الخام.")
-        engine = "raw"
-        audio = synthesize(text, voice, rate)
+    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate)
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
 
@@ -847,7 +1166,8 @@ def tts_endpoint():
         mimetype="audio/mpeg",
         headers={
             "X-Tashkeel-Engine": engine,
-            "X-Voice": voice,
+            "X-Tashkeel-Diacrit": diac_engine,
+            "X-Voice": voice_used,
             "Cache-Control": "no-store",
         },
     )
@@ -905,6 +1225,46 @@ def tts_gemini_endpoint():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/tts/status", methods=["GET"])
+def tts_status():
+    """تشخيص سريع: أي محرك مُفعّل/مُستنفد/في كولداون + الحصص الشهرية.
+
+    أرقام ومنطق فقط — لا يُعرض أي مفتاح ولا سر.
+    """
+    def state(name):
+        used, quota, pct, month = _engine_budget_state(name)
+        configured = (name == "cartesia" and bool(CARTESIA_API_KEY)) or (
+            name == "azure" and _azure_enabled()
+        )
+        return {
+            "configured": configured,
+            "active": configured
+            and not _engine_soft_stopped(name)
+            and not _engine_blocked(name),
+            "cooldown": _engine_blocked(name),
+            "soft_stopped": _engine_soft_stopped(name),
+            "usage_pct": round(pct * 100, 1),
+            "chars_used": used,
+            "chars_quota": quota,
+            "quota_month": month,
+        }
+
+    if TTS_ENGINE == "auto":
+        effective = ["cartesia", "azure", "edge"]
+    elif TTS_ENGINE in ("cartesia", "azure"):
+        effective = [TTS_ENGINE, "edge"]
+    else:
+        effective = ["edge"]
+
+    return jsonify({
+        "tts_enabled": TTS_ENABLED,
+        "engine_mode": TTS_ENGINE,
+        "effective_order": effective,
+        "engines": {"cartesia": state("cartesia"), "azure": state("azure")},
+        "edge": {"enabled": TTS_ENABLED, "voice": EDGE_FALLBACK_VOICE},
+    })
 
 
 # شحن كاش LLM من القرص عند بدء التشغيل (لا يُهدر الحصة على النصوص المتكررة).

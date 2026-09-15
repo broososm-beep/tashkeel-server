@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+llm_cache.json
+gemini_diag.py
+*key*.txt
+*.log
+.venv/

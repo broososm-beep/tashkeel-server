@@ -44,7 +44,8 @@ Endpoints جديدة (إضافية، اختيارية):
     CARTESIA_TIMEOUT   مهلة Cartesia بالثواني، افتراضي 30
     CARTESIA_COOLDOWN  كولداون السقوط بعد فشل Cartesia (ثوانٍ)، افتراضي 900
     TTS_ENGINE         auto (سلم Cartesia→Azure→Edge) | cartesia | azure | edge
-    GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-3.6-flash (عند عدم دعمه للصوت يُتخطى بكاش سلبي)
+    GEMINI_AUDIO_MODEL  نموذج الصوت الذكي، افتراضي gemini-2.5-flash-preview-tts (نموذج TTS مخصص — الصوت الأصلي غير مدعوم على النماذج العامة)
+    GEMINI_AUDIO_MODELS قائمة سقوط مفصولة بفواصل؛ الأول ثم البدائل، افتراضي gemini-2.5-flash-preview-tts,gemini-3.1-flash-tts-preview,gemini-2.5-pro-preview-tts
     GEMINI_AUDIO_VOICE  صوت Gemini الافتراضي، افتراضي Aoede
     GEMINI_AUDIO_TIMEOUT مهلة توليد صوت Gemini بالثواني، افتراضي 60
     PORT             (يضبطه Render تلقائياً)
@@ -216,11 +217,25 @@ def _strip_tashkeel(text):
     return _TASHKEEL_MARKS_RE.sub("", text or "")
 
 # ── المحرك الذكي: صوت Gemini الأصلي (responseModalities AUDIO) ──
+# الصوت الأصلي مدعوم على نماذج TTS المخصصة فقُط (النماذج العامة كـ gemini-3.6-flash
+# تعيد نصاً لا صوتاً). GEMINI_AUDIO_MODEL يحدد الأول، وقائمة GEMINI_AUDIO_MODELS
+# قائمة سقوط احتياطية تُجرَّب بالترتيب عند فشل/حجب سابق.
 GEMINI_AUDIO_MODEL = (
-    os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.6-flash")
+    os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.5-flash-preview-tts")
     .strip()
     .replace("models/", "")
 )
+GEMINI_AUDIO_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_AUDIO_MODELS",
+        "gemini-2.5-flash-preview-tts,gemini-3.1-flash-tts-preview,"
+        "gemini-2.5-pro-preview-tts",
+    ).split(",")
+    if m.strip()
+] or [GEMINI_AUDIO_MODEL]
+if GEMINI_AUDIO_MODEL not in GEMINI_AUDIO_MODELS:
+    GEMINI_AUDIO_MODELS.insert(0, GEMINI_AUDIO_MODEL)
 GEMINI_AUDIO_VOICE = os.environ.get("GEMINI_AUDIO_VOICE", "Aoede").strip()
 GEMINI_AUDIO_TIMEOUT = float(os.environ.get("GEMINI_AUDIO_TIMEOUT", "60"))
 # أصوات Gemini المدعومة رسمياً (للتحقق/التوثيق فقط؛ أي اسم يمرره جوجل يقبلها).
@@ -783,46 +798,71 @@ def synthesize(text, voice, rate_pct=0):
 #  المحرك الذكي: صوت Gemini الأصلي + بثّ استجابة مع Range
 # ════════════════════════════════════════════════════════════════
 
-# كاش سلبي لما يفشل صوت Gemini (404/غير مدعوم/مهلة): النموذج يُتجاهل مؤقتاً
-# حتى لا نُهدر محاولتين بصوت فاشل في كل جملة بمحرك gemini.
+# كاش سلبي لما يفشل صوت Gemini (404/غير مدعوم/مهلة/استجابة نصية): كلُّ نموذج
+# يُتجاهل مؤقتاً حتى لا نُهدر محاولات في كل جملة. المفتاح = اسم النموذج.
 _audio_neg_cache = {}
 _audio_neg_lock = threading.Lock()
 _AUDIO_NEG_COOLDOWN = float(os.environ.get("GEMINI_AUDIO_COOLDOWN", "900"))
 
 
-def _audio_model_blocked():
+def _audio_model_blocked(model):
     """بعد انتهاء كولداون العودة محاولة النموذج الصوتي. يعيد True إن كان محظوراً."""
     with _audio_neg_lock:
-        until = _audio_neg_cache.get(GEMINI_AUDIO_MODEL, 0.0)
+        until = _audio_neg_cache.get(model, 0.0)
         if until > time.monotonic():
             return True
         if until:
-            _audio_neg_cache.pop(GEMINI_AUDIO_MODEL, None)
+            _audio_neg_cache.pop(model, None)
         return False
 
 
-def _block_audio_model(reason):
-    """يسجّل فشل النموذج الصوتي ويمنعه مؤقتاً في الطلبات التالية."""
+def _block_audio_model(model, reason):
+    """يسجّل فشل نموذج صوتي ويمنعه مؤقتاً في الطلبات التالية."""
     with _audio_neg_lock:
-        _audio_neg_cache[GEMINI_AUDIO_MODEL] = time.monotonic() + _AUDIO_NEG_COOLDOWN
+        _audio_neg_cache[model] = time.monotonic() + _AUDIO_NEG_COOLDOWN
     logger.warning(
-        "نموذج الصوت %s يتعذّر (%s)؛ يُتخطى محاولات الصوت لـ %is…",
-        GEMINI_AUDIO_MODEL,
+        "نموذج الصوت %s يتعذّر (%s)؛ يُتخطى محاولاته لـ %is…",
+        model,
         reason,
         int(_AUDIO_NEG_COOLDOWN),
     )
+
+
+# أجزاء قد تحمل الصوت: Gemini TTS قد يعيد تعدد أجزاء (موجة صوتية واحدة عادةً).
+def _extract_audio_from_parts(parts):
+    """يبحث في كل الأجزاء عن أول inlineData صوتي. يعيد (bytes, mime) أو None."""
+    for part in parts or []:
+        inline = part.get("inlineData", {})
+        mime = inline.get("mimeType", "")
+        audio = base64.b64decode(inline.get("data", ""))
+        if audio and len(audio) >= 100 and mime.startswith("audio/"):
+            return audio, mime
+    return None
 
 
 def _gemini_audio(text, voice_name):
     """يولّد صوتاً أَمثل من Gemini عبر responseModalities:["AUDIO"].
 
     يعيد (bytes, mimetype) عند النجاح وإلا None (ينسَكب الواجهة إلى Edge).
-    لا يحاول النموذج أثناء الكولداون السلبي بعد فشل سابق.
+    يجرب النماذج في GEMINI_AUDIO_MODELS بالترتيب، متخطياً المحظور مؤقتاً —
+    والصوت الأصلي مدعوم على نماذج TTS المخصصة فقط.
     """
     if not GEMINI_API_KEY:
         return None
-    if _audio_model_blocked():
-        return None
+    for model in GEMINI_AUDIO_MODELS:
+        if _audio_model_blocked(model):
+            continue
+        audio_mime = _gemini_audio_single(text, voice_name, model)
+        if audio_mime:
+            return audio_mime
+    return None
+
+
+def _gemini_audio_single(text, voice_name, model):
+    """محاولة واحدة على نموذج صوتي محدد. يعيد (bytes, mime) أو None.
+
+    عند رفض/فشل النموذج يُحظَر مؤقتاً (لكي يُجرَّب البديل في GEMINI_AUDIO_MODELS).
+    """
     payload = {
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {
@@ -836,7 +876,7 @@ def _gemini_audio(text, voice_name):
     }
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_AUDIO_MODEL}:generateContent"
+        f"{model}:generateContent"
     )
     req = urllib.request.Request(
         url,
@@ -853,29 +893,35 @@ def _gemini_audio(text, voice_name):
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         logger.error(
-            "Gemini-Audio رفض الطلب (%s) بتفاصيل: %s", exc.code, detail[:1200]
+            "Gemini-Audio رفض الطلب على %s (%s) بتفاصيل: %s",
+            model, exc.code, detail[:1200],
         )
         if exc.code in (400, 403, 404, 429):
-            _block_audio_model(f"HTTP {exc.code}")
+            _block_audio_model(model, f"HTTP {exc.code}")
         return None
     except Exception as exc:  # noqa: BLE001
-        logger.error("خطأ اتصال بـ Gemini-Audio: %s:%s", type(exc).__name__, exc)
+        logger.error("خطأ اتصال بـ Gemini-Audio (%s): %s:%s", model,
+                     type(exc).__name__, exc)
         return None
     try:
-        part = data["candidates"][0]["content"]["parts"][0]
-        inline = part.get("inlineData", {})
-        mime = inline.get("mimeType", "")
-        audio = base64.b64decode(inline.get("data", ""))
-        if not audio or len(audio) < 100 or not mime.startswith("audio/"):
-            logger.error(
-                "Gemini-Audio استجابة فارغة أو غير صوتية: %d بايت (%s).",
-                len(audio), mime,
-            )
-            return None
-        return audio, mime
+        parts = data["candidates"][0]["content"].get("parts") or []
+        found = _extract_audio_from_parts(parts)
+        if found:
+            return found
+        # استجابة بلا صوت (نموذج نصي عام أو صوت محجوب): نوثّق ونحظر ثم نجرب البديل.
+        texts = [p.get("text", "") for p in parts if p.get("text")]
+        logger.warning(
+            "Gemini-Audio (%s) استجابة بدون صوت؛ أول فينبك: %r — نص إذا وُجد: %s",
+            model,
+            data.get("promptFeedback", {})[:200],
+            (" ".join(texts))[:120] or "(بلا نص)",
+        )
+        _block_audio_model(model, "استجابة نصية/صامتة")
+        return None
     except (KeyError, IndexError, TypeError):
-        logger.error("استجابة Gemini-Audio بلا inlineData: %s",
-                     json.dumps(data, ensure_ascii=False)[:400])
+        logger.error("استجابة Gemini-Audio بلا inlineData (%s): %s",
+                     model, json.dumps(data, ensure_ascii=False)[:400])
+        _block_audio_model(model, "بلا candidates")
         return None
 
 

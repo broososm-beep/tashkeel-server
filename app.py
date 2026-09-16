@@ -913,7 +913,7 @@ def _gemini_audio_single(text, voice_name, model):
         logger.warning(
             "Gemini-Audio (%s) استجابة بدون صوت؛ أول فينبك: %r — نص إذا وُجد: %s",
             model,
-            data.get("promptFeedback", {})[:200],
+            json.dumps(data.get("promptFeedback", {}), ensure_ascii=False)[:200],
             (" ".join(texts))[:120] or "(بلا نص)",
         )
         _block_audio_model(model, "استجابة نصية/صامتة")

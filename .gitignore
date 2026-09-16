@@ -6,3 +6,6 @@ gemini_diag.py
 *key*.txt
 *.log
 .venv/
+
+# نماذج CATT (ONNX ~74MB تُنزَّل تلقائياً من GitHub Releases في أول تشغيل)
+catt_tashkeel/onnx_models/

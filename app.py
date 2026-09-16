@@ -7,23 +7,26 @@
     GET  /health                                          → {"status": "ok"}          (200)
 
 Endpoints جديدة (إضافية، اختيارية):
-    POST /tashkeel/context  {"text": "..."}               → {"diacritized": "...", "engine": "llm|onnx|raw"} (200)
+    POST /tashkeel/context  {"text": "..."}               → {"diacritized": "...", "engine": "llm|catt|onnx|raw"} (200)
         معالجة سياقية كاملة: النص كاملاً يذهب إلى Gemini بنظام-تعليمات صارم (إعراب،
         التقاء ساكنين، ضرورات شعرية). عند غياب المفتاح/المهلة/الفشل → سقوط آلي إلى
-        محرك ONNX المحلي ثم إلى النص الخام. لن يتوقف أبداً.
+        CATT (محرك ONNX محلي دقيق) ثم إلى محرك ONNX ثم النص الخام. لن يتوقف أبداً.
     POST /tts-gemini  {"text": "...", "voice_name": "Aoede", "rate": 0} → صوت (audio/wav|audio/mpeg)
         المحرك الذكي: تشكيل سياقي (بالسقوط الآلي) ثم صوت Gemini الأصلي عبر
         responseModalities=["AUDIO"] + speechConfig.voiceName (Aoede/Charon/Fenrir/Kore/Puck).
         الاستجابة بثّية (StreamingResponse) مع دعم Range (206) لفكّ TextStream لدى
         مشغّل Flutter والترجيع/التقديم بأمان. إن لم يكن مفتاحك يدعم نموذجاً صوتياً
         ينزل آلياً إلى دفق Edge (نفس /tts) دون كسر. header X-Tashkeel-Engine =
-        gemini-audio|edge و X-Tashkeel-Diacrit = llm|onnx|raw.
+        gemini-audio|edge و X-Tashkeel-Diacrit = llm|catt|onnx|raw.
 
 بيئة التشغيل (Environment Variables على Render):
     GEMINI_API_KEY   مفتاح Google Gemini (إلزامي للمسار السياقي LLM؛ بدونه LLM=ONNX)
     GEMINI_MODEL     النموذج، افتراضي gemini-3.6-flash (عند مستخدم جديد 2.5-flash غير متاح — يرجع Google 404)
     GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 25
     GEMINI_MAX_CHARS حدّ أقصى لأحرف نص LLM، فوقه سقوط فوري إلى ONNX، افتراضي 1500
+    CATT_MAX_CHARS   حدّ CATT لكل قطعة ONNX، افتراضي 1024 (سقف النموذج)
+    CATT_TIMEOUT     مهلة CATT بالثواني، افتراضي 60
+    CATT_MIN_LEN     حدّ أدنى لعدد علامات تشكيل CATT كي تُقبل نتيجته، افتراضي 0
     TASHKEEL_TTS_VOICE  صوت النطق الافتراضي، افتراضي ar-EG-ShakirNeural
     TTS_ENABLED      true|false يعطل/يفعل /tts ، افتراضي true
     TTS_TIMEOUT      مهلة التوليف بالثواني، افتراضي 45
@@ -111,6 +114,15 @@ TTS_ENGINE = os.environ.get("TTS_ENGINE", "auto").strip().lower()
 # حصص الشهر (نسبة التوقف الناعم 95% — عدّاد احترازي للسيرفر لا عدّاد فاتورة).
 _ENGINE_QUOTAS = {"cartesia": 20000, "azure": 500000}
 _ENGINE_SOFT_STOP_RATIO = 0.95
+
+# ── CATT: محرك تشكيل محلي (Char-BERT ONNX) — Apache-2.0، بلا طلبات خارجية ──────
+# الحزمة مدمجة (vendored) تحت catt_tashkeel/ ليبقى onnxruntime CPU فقط على Render
+# (الحزمة الأصلية تُجبر onnxruntime-gpu/CUDA). النموذج EO (~74MB ONNX) يُنزَّل
+# مرة واحدة من GitHub Releases ثم يُخزَّن محلياً؛ سقف النموذج 1024 حرفاً.
+CATT_MAX_CHARS = int(float(os.environ.get("CATT_MAX_CHARS", "1024")))
+CATT_TIMEOUT = float(os.environ.get("CATT_TIMEOUT", "60"))
+# حدّ أدنى لاعتبار نتيجة CATT مشكَّلة (مثلاً النص الخام القصير يبقى بلا تنوين ظاهر).
+CATT_MIN_LEN = int(float(os.environ.get("CATT_MIN_LEN", "0")))
 
 # ── برادع الأسرار من السجلات (أمان المفاتيح) ─────────────────────────────────
 class _SecretRedactor(logging.Filter):
@@ -267,6 +279,110 @@ def get_diacritizer():
 def is_arabic_text(text):
     """يتحقق من احتواء النص على حروف عربية (لا يشكّل النص الإنجليزي)."""
     return any("\u0600" <= ch <= "\u06FF" for ch in text)
+
+
+# ════════════════════════════════════════════════════════════════
+#  CATT — تشكيل محلي دقيق (Char-BERT ONNX، Apache-2.0)
+# ════════════════════════════════════════════════════════════════
+
+_catt_model = None
+_catt_lock = threading.Lock()
+_catt_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="catt")
+
+# مقاطع عربية فقط: حروف عربية + مسافات داخلية (المقطع=كلمة أو مجموعة كلمات).
+# يقسّم النص بحيث يمرّ عبر CATT الجزءُ العربي وحده، ويُتركُ الترقيم/اللاتينية/
+# الأرقام في أماكنها كما هي (do_tashkeel يمسح غير العربي لكننا نمرّره مقاطع نقية).
+# [ \t]+ بين الكلمات فقط (لا مسافة نهاية) حتى لا تبتلع المسافة قبل الرقم/الترقيم.
+_ARABIC_RUN_RE = re.compile(
+    r"[\u0621-\u063A\u0640-\u064A]+(?:[ \t]+[\u0621-\u063A\u0640-\u064A]+)*"
+)
+
+
+def _get_catt_model():
+    """يحمّل نموذج CATT EO مرة واحدة فقط (خيط آمن، تحميل كسول في أول استدعاء)."""
+    global _catt_model
+    if _catt_model is None:
+        with _catt_lock:
+            if _catt_model is None:
+                from catt_tashkeel import CATTEncoderOnly  # حزمة مدمجة محلياً
+                _catt_model = CATTEncoderOnly()
+                logger.info("تم تحميل CATT EO (ONNX، CPU).")
+    return _catt_model
+
+
+def _catt_chunks(segment):
+    """يقسّم مقطعاً عربياً (قد يعلو عن حد النموذج) إلى قطع ≤ CATT_MAX_CHARS على حدود الكلمات."""
+    segment = segment.strip()
+    if len(segment) <= CATT_MAX_CHARS:
+        return [segment]
+    out = []
+    buf = []
+    buf_len = 0
+    for word in segment.split():
+        w = len(word)
+        if buf_len + (1 if buf else 0) + w > CATT_MAX_CHARS:
+            if buf:
+                out.append(" ".join(buf))
+            buf = [word]
+            buf_len = w
+        else:
+            buf.append(word)
+            buf_len += (1 if len(buf) > 1 else 0) + w
+    if buf:
+        out.append(" ".join(buf))
+    return out
+
+
+def _catt_diacritize(text):
+    """تشكيل محلي عبر CATT EO مع الحفاظ التام على الترقيم/الأرقام/اللاتينية.
+
+    يُقسّم النص إلى مقاطع عربية نقية، يُشكَّل كلُّ مقطع (مع تقطيع ≤1024 حرفاً)،
+    ثم يُعاد تركيبُ النص بحيث تبقى الرموز غير العربية في مواقعها. عند أي فشل
+    تُعاد بقيةُ المقاطع كما هي — يُكمل السقوط الآلي.
+    """
+    model = _get_catt_model()
+    parts = []
+    pos = 0
+    for m in _ARABIC_RUN_RE.finditer(text):
+        seg = m.group(0)
+        if not seg or not is_arabic_text(seg):
+            continue
+        parts.append(text[pos : m.start()])          # غير العربي قبل المقطع
+        chunks = _catt_chunks(seg)
+        try:
+            out = model.do_tashkeel_batch(chunks, verbose=False)
+            parts.append("".join(out))
+        except Exception:
+            logger.warning("CATT فشل على مقطع؛ يُكمل السقوط الآلي:\n%s",
+                           traceback.format_exc())
+            parts.append(seg)
+        pos = m.end()
+    parts.append(text[pos:])                          # ذيل قافي (غير عربي)
+    return "".join(parts)
+
+
+def _catt_diacritize_safe(text):
+    """مسار CATT بمهلة زمنية صارمة؛ أي فشل/مهلة → None (فيُفعَّل ما بعده)."""
+    if not text or not is_arabic_text(text):
+        return None
+    if len(text) > CATT_MAX_CHARS * 8:
+        logger.info("نص طويل (%d حرفاً)؛ نتخطى CATT إلى المحرك التالي.", len(text))
+        return None
+    try:
+        fut = _catt_pool.submit(_catt_diacritize, text)
+        out = fut.result(timeout=CATT_TIMEOUT)
+    except TimeoutError:
+        logger.warning("CATT تجاوز المهلة (%ss)؛ ننتقل إلى البديل.", CATT_TIMEOUT)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("استدعاء CATT فشل: %s:%s", type(exc).__name__, exc)
+        return None
+    if not out or out == text:
+        return None
+    marks = len(_looks_diacritized_re.findall(out))
+    if marks < CATT_MIN_LEN:
+        return None
+    return out
 
 
 # ════════════════════════════════════════════════════════════════
@@ -458,18 +574,21 @@ def _llm_diacritize_safe(text):
 
 
 def context_diacritize(text):
-    """سلسلة السقوط الآلي: Gemini→ONNX→النص الخام. لا تعود None أبداً.
+    """سلسلة السقوط الآلي: Gemini→CATT→ONNX→النص الخام. لا تعود None أبداً.
 
-    نصٌّ شُكِّل سابقاً (مثل ما يرسله التطبيق بعد تشكيل ONNX) يمرّ كما هو
+    نصٌّ شُكِّل سابقاً (مثل ما يرسله التطبيق بعد تشكيل CATT/ONNX) يمرّ كما هو
     بمرحلة "pass" دون أي استدعاء — يحفظ الحصة المجانية.
 
-    تُرجع (النص المٌشكَّل، اسم المرحلة المستخدمة: llm|onnx|pass|raw).
+    تُرجع (النص المٌشكَّل، اسم المرحلة المستخدمة: llm|catt|onnx|pass|raw).
     """
     if _looks_diacritized(text):
         return text, "pass"
     llm_out = _llm_diacritize_safe(text)
     if llm_out:
         return llm_out, "llm"
+    catt_out = _catt_diacritize_safe(text)
+    if catt_out:
+        return catt_out, "catt"
     try:
         return get_diacritizer().diacritize(text), "onnx"
     except Exception:
@@ -1098,17 +1217,25 @@ def audio_tts_gemini_get():
 
 @app.route("/tashkeel", methods=["POST"])
 def tashkeel():
-    """العقد الإلزامي القديم — دون أي تغيير (توافق كامل مع تطبيق الموبايل)."""
+    """العقد الإلزامي القديم — توافق كامل مع تطبيق الموبايل، بدقة أعلى الآن.
+
+    يستخدم السلم السياقي (Gemini→CATT→ONNX→الخام) ليرتفع جودةُ النص الذي
+    يعرضه التطبيق ويعيد إرساله إلى النطق. إضافةً للسابق «engine» اختيارية
+    (لا يكسر تطبيقاً يقرأ «diacritized» فقط).
+    """
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty text"}), 400
     if not is_arabic_text(text):
         # نص بلا حروف عربية: يُعاد كما هو دون تشكيل (مكافئ FR-4)
-        return jsonify({"diacritized": text})
+        return jsonify({"diacritized": text, "engine": "pass"})
     try:
-        result = get_diacritizer().diacritize(text)
-        return jsonify({"diacritized": result})
+        result, engine = context_diacritize(text)
+        out = {"diacritized": result}
+        if engine:
+            out["engine"] = engine
+        return jsonify(out)
     except Exception:
         logger.error("فشل عملية التشكيل:\n%s", traceback.format_exc())
         return jsonify({"error": "diacritization failed"}), 500
@@ -1145,7 +1272,7 @@ def tts_endpoint():
 
     السقوط الآلي: أي محرك حصّة فاشل يُتخطى؛ وEdge ناطق النص المشكَّل ثم الخام —
     فلا يتوقف التطبيق.
-    الرؤوس: X-Tashkeel-Engine = cartesia|azure|edge ، X-Tashkeel-Diacrit = llm|onnx|raw ،
+    الرؤوس: X-Tashkeel-Engine = cartesia|azure|edge ، X-Tashkeel-Diacrit = llm|catt|onnx|raw ،
     X-Voice المستخدم الفعلي.
     """
     if not TTS_ENABLED:

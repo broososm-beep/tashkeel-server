@@ -1216,7 +1216,7 @@ def _cartesia_tts_bytes(text, rate_pct):
     return audio
 
 
-def _synth_ladder(text, voice, rate):
+def _synth_ladder(text, voice, rate, requested_engine=None):
     """سلم المحركات: تشكيل واحد ← Cartesia→Azure→Edge (حسب TTS_ENGINE).
 
     يعيد (audio|None, engine: cartesia|azure|edge, voice_used, diac_engine).
@@ -1225,8 +1225,18 @@ def _synth_ladder(text, voice, rate):
         (حروف مُفوترة أقل)؛ إعادة المُشكَّل حصراً للسقوط الأخير (Edge).
       • TTS_ENGINE يقيّد خيارات الحصّة فقط؛ Edge يبقى الملاذ الأخير دائماً
         (نطق مشكَّل ثم خام) — لا يتوقف مطلقاً، ويرفع أي صوت محترم بتفجيعات.
+      • requested_engine (اختياري من التطبيق: auto|cartesia|azure|edge)
+        يتجاوز TTS_ENGINE لهذا الطلب — ليدفع الجوال «Azure/Edge مباشرة».
     """
-    preferred = TTS_ENGINE if TTS_ENGINE != "auto" else None
+    req = (requested_engine or "").strip().lower()
+    if req in ("cartesia", "azure", "edge"):
+        base = req
+    elif req == "" or req == "auto":
+        base = TTS_ENGINE
+    else:
+        logger.warning("محرك غير معروف «%s»؛ نستخدم TTS_ENGINE.", requested_engine)
+        base = TTS_ENGINE
+    preferred = base if base != "auto" else None
     candidates = ["cartesia", "azure"] if preferred is None else ([preferred] if preferred in (
         "cartesia", "azure") else [])
     result, diac_engine = context_diacritize(text)
@@ -1257,6 +1267,8 @@ def audio_tts_get():
     """نفس /tts لكن عبر GET — للبث المباشر لدى just_audio/ExoPlayer مع Range (206).
 
     السلم الكامل (TTS_ENGINE): Cartesia→Azure→Edge، بنفس انضباط /tts.
+    معامل اختياري engine=auto|cartesia|azure|edge يتجاوز TTS_ENGINE لهذا الطلب
+    (لتختار واجهة الجوال «محركاً مباشراً» دون تغيير بيئة الخادم).
     الرؤوس: X-Tashkeel-Engine = cartesia|azure|edge ، X-Tashkeel-Diacrit ، X-Voice.
     """
     if not TTS_ENABLED:
@@ -1266,7 +1278,8 @@ def audio_tts_get():
         return jsonify({"error": "empty text"}), 400
     voice = request.args.get("voice") or TTS_VOICE
     rate = _parse_rate(request.args.get("rate", "0"))
-    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate)
+    requested = request.args.get("engine", "")
+    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate, requested)
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
     resp = _audio_response(audio, "audio/mpeg")
@@ -1401,6 +1414,8 @@ def tts_endpoint():
 
     السقوط الآلي: أي محرك حصّة فاشل يُتخطى؛ وEdge ناطق النص المشكَّل ثم الخام —
     فلا يتوقف التطبيق.
+    body (اختياري): "engine": "auto|cartesia|azure|edge" يتجاوز TTS_ENGINE لهذا
+    الطلب (لتختار واجهة الجوال «محركاً مباشراً» دون تغيير بيئة الخادم).
     الرؤوس: X-Tashkeel-Engine = cartesia|azure|edge ، X-Tashkeel-Diacrit = llm|catt|onnx|raw ،
     X-Voice المستخدم الفعلي.
     """
@@ -1412,8 +1427,9 @@ def tts_endpoint():
         return jsonify({"error": "empty text"}), 400
     voice = data.get("voice") or TTS_VOICE
     rate = _parse_rate(data.get("rate", "0"))
+    requested = str(data.get("engine") or "")
 
-    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate)
+    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate, requested)
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
 

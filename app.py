@@ -52,6 +52,7 @@ Endpoints جديدة (إضافية، اختيارية):
 """
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import wave
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from flask import Flask, Response, jsonify, request
@@ -954,6 +956,60 @@ def _chunks(data, size=32768):
         yield data[i:i + size]
 
 
+# يحلل mime مثل "audio/L16;codec=pcm;rate=24000" → (rate, channels, sample_width).
+_PCM_META_RE = re.compile(
+    r"rate=(\d+)"
+)
+
+
+def _pcm_mime_meta(mimetype, fallback_rate=24000, fallback_channels=1,
+                   fallback_width=2):
+    """يستخرج (sample_rate, channels, sample_width) من mimetype PCM.
+
+    L16/PCM خام من Gemini (audio/L16;codec=pcm;rate=24000) بلا حاوية صوتية —
+    مشغّلات الجوال (ExoPlayer) ترفض فكّه عبر HTTP بدون رأس WAV. نقدّر
+    معدل/قنوات/عمق من mimetype، ونلجأ لأكثر قيماً شيوعاً عند الغياب.
+    """
+    sr = fallback_rate
+    m = _PCM_META_RE.search(mimetype or "")
+    if m:
+        sr = int(m.group(1))
+    width = fallback_width
+    if "L16" in (mimetype or "") or "s16" in (mimetype or ""):
+        width = 2
+    elif "L8" in (mimetype or "") or "s8" in (mimetype or ""):
+        width = 1
+    return sr, fallback_channels, width
+
+
+def _pcm_to_wav(data, mimetype):
+    """يغلّف PCM الخام برأس RIFF/WAV قياسي (44 بايتاً) عبر wave+BytesIO.
+
+    يعيد (wav_bytes, "audio/wav"). يستنسخ البايت بعد الضبط لأن wave.setframes
+    يعنون موجَّهاً داخل BytesIO (لا يؤثر في البيانات الأصلية).
+    """
+    rate, channels, width = _pcm_mime_meta(mimetype)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(width)
+        wf.setframerate(rate)
+        wf.writeframes(data)
+    return buf.getvalue(), "audio/wav"
+
+
+def _gemini_wav_or_raw(audio, mime):
+    """يغلف PCM الخام من Gemini بحاوية WAV كي يفكّه جوالك؛ وإلا يقبل الملف كما هو.
+
+    MIME "audio/L16;codec=pcm;rate=...": يُلفّ WAV. أي صيغة حاوية (WAV/OGG/MP3)
+    من جوجل: تُمرَّر كما هي مع تقطيع Range.
+    """
+    mimetype = (mime or "").split(";")[0].strip().lower()
+    if mimetype == "audio/l16" or "codec=pcm" in (mime or "").lower():
+        return _pcm_to_wav(audio, mime)
+    return audio, mime
+
+
 def _audio_response(data, mimetype):
     """استجابة صوت بثّية مع دعم Range (206) — ليمكّن مشغّل Flutter من
     الترجيع/التقديم بأمان داخل ما تحمَّل (Buffered) حتى قبل اكتمال التنزيل."""
@@ -1221,22 +1277,48 @@ def audio_tts_get():
     return resp
 
 
-@app.route("/audio/tts-gemini", methods=["GET"])
-def audio_tts_gemini_get():
-    """المحرك الذكي عبر GET — صوت Gemini عند جاهزيته، وإلا سقوط آلي
-    إلى MP3 Edge مُتحقَّقٍ منه (Content-Length + Range 206) — لا يتوقف أبداً."""
+@app.route("/audio/tts-gemini", methods=["GET", "POST"])
+def audio_tts_gemini():
+    """المحرك الذكي — GET وPOST معاً (توافق كامل لأسلوب الجوال وبأي شكل).
+
+    GET:  /audio/tts-gemini?text=...&voice_name=...&rate=...  (سلوك قديم)
+    POST: {"text": "...", "voice_name": "Aoede", "rate": 0}    (اختياري JSON)
+
+    عند جاهزية صوت Gemini يُعاد صوتٌ مشغَّل بالجمل (PCM خام يُغلَّف WAV قياسي
+    كي يفكّه مشغّل Flutter/ExoPlayer)، وإلا سقوطٌ آلي إلى MP3 Edge مُتحقَّقٍ منه
+    (Content-Length + Range 206) — لا يتوقف أبداً.
+    الرؤوس: X-Tashkeel-Engine = gemini-audio|edge ، X-Tashkeel-Diacrit ، X-Voice.
+    """
     if not TTS_ENABLED:
         return jsonify({"error": "tts disabled"}), 404
-    text = (request.args.get("text") or "").strip()
+
+    # قراءة موحّدة: POST يحوي JSON أو معاملات؛ GET يقرأ query (السلوك القديم).
+    if request.method == "POST":
+        data = (request.get_json(silent=True) or {})
+        text = (data.get("text") or request.args.get("text") or "").strip()
+        voice = (
+            data.get("voice_name")
+            or data.get("voice")
+            or request.args.get("voice_name")
+            or GEMINI_AUDIO_VOICE
+        ).strip()
+        rate = data.get("rate", request.args.get("rate", "0"))
+    else:
+        text = (request.args.get("text") or "").strip()
+        voice = (request.args.get("voice_name") or GEMINI_AUDIO_VOICE).strip()
+        rate = request.args.get("rate", "0")
+    rate_pct = _parse_rate(rate)
     if not text:
         return jsonify({"error": "empty text"}), 400
-    voice = (request.args.get("voice_name") or GEMINI_AUDIO_VOICE).strip()
-    rate = _parse_rate(request.args.get("rate", "0"))
 
+    # تشكيل سياقي (نص كامل) مع سقوط آلي حتى الخام.
     result, diac_engine = context_diacritize(text)
+
+    # جرّب صوت Gemini الأصلي (نموذج TTS إن كان مفعّلاً لمفتاحك).
     audio_mime = _gemini_audio(result, voice)
     if audio_mime is not None:
         audio, mime = audio_mime
+        audio, mime = _gemini_wav_or_raw(audio, mime)
         resp = _audio_response(audio, mime)
         resp.headers["X-Tashkeel-Engine"] = "gemini-audio"
         resp.headers["X-Tashkeel-Diacrit"] = diac_engine
@@ -1244,8 +1326,9 @@ def audio_tts_gemini_get():
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
+    # سقوط آلي: MP3 Edge مُتحقَّقٍ منه من النص المشكَّل (ثم الخام إن تعثر).
     logger.warning("صوت Gemini غير متاح؛ نُستخدم محرك Edge.")
-    audio, voice_used = _edge_fallback_bytes(result, text, rate, EDGE_FALLBACK_VOICE)
+    audio, voice_used = _edge_fallback_bytes(result, text, rate_pct, EDGE_FALLBACK_VOICE)
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
     resp = _audio_response(audio, "audio/mpeg")
@@ -1374,6 +1457,7 @@ def tts_gemini_endpoint():
     audio_mime = _gemini_audio(result, voice)
     if audio_mime is not None:
         audio, mime = audio_mime
+        audio, mime = _gemini_wav_or_raw(audio, mime)
         resp = _audio_response(audio, mime)
         resp.headers["X-Tashkeel-Engine"] = "gemini-audio"
         resp.headers["X-Tashkeel-Diacrit"] = diac_engine

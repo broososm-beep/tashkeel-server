@@ -22,6 +22,9 @@ Endpoints جديدة (إضافية، اختيارية):
 بيئة التشغيل (Environment Variables على Render):
     GEMINI_API_KEY   مفتاح Google Gemini (إلزامي للمسار السياقي LLM؛ بدونه LLM=ONNX)
     GEMINI_MODEL     النموذج، افتراضي gemini-3.6-flash (عند مستخدم جديد 2.5-flash غير متاح — يرجع Google 404)
+    GEMINI_DIACRIT_MODELS قائمة نماذج تشكيل احتياطية مفصولة بفواصل؛ تُجرَّب بعد
+                        GEMINI_MODEL عند رفضه (404/403) مع كاش حجب مؤقت
+    GEMINI_DIACRIT_COOLDOWN كولداون النموذج المرفوض بالثواني، افتراضي 600
     GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 25
     GEMINI_MAX_CHARS حدّ أقصى لأحرف نص LLM، فوقه سقوط فوري إلى ONNX، افتراضي 1500
     CATT_MAX_CHARS   حدّ CATT لكل قطعة ONNX، افتراضي 1024 (سقف النموذج)
@@ -82,6 +85,21 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = (
     os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip().replace("models/", "")
 )
+# سلّم نماذج التشكيل (مثل سلّم الصوت): الأول = GEMINI_MODEL، ثم قائمة
+# GEMINI_DIACRIT_MODELS المضافة من البيئة، ثم نماذج بديلة افتراضية —
+# تُجرَّب بالترتيب ويُحجَب النموذج المرفوض (404/403) مؤقتاً كي لا يُهدر
+# رحلة-ذهاب في كل طلب. جوجل تُوقف نماذج عن المستخدمين الجدد بين حينٍ وآخر
+# (مثل gemini-2.5-flash) وبدون هذا السلّم يسقط التشكيل كله على CATT صامتاً.
+GEMINI_DIACRIT_MODELS = list(dict.fromkeys([
+    GEMINI_MODEL,
+    *[m.strip() for m in os.environ.get("GEMINI_DIACRIT_MODELS", "").split(",")
+      if m.strip()],
+    "gemini-3.6-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+]))
+# كولداون النموذج المرفوض (ثوانٍ) — بعده يُعاد تجربته.
+GEMINI_DIACRIT_COOLDOWN = float(os.environ.get("GEMINI_DIACRIT_COOLDOWN", "600"))
 GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
 MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1500"))
 
@@ -413,16 +431,17 @@ def _catt_diacritize_safe(text):
 # ════════════════════════════════════════════════════════════════
 
 
-def _llm_request(payload):
-    """ينفّذ طلباً واحداً لـ Gemini ويعيد dict الرد أو None (مع تفاصيل الخطأ).
+def _llm_request(payload, model=None):
+    """ينفّذ طلباً واحداً لـ Gemini ويعيد (dict الرد, status_http) أو (None, code).
 
     عند استنفاد الحصة (429) يقرأ ثانية واحدة بعد المهلة التي تشير إليها جوجل،
-    ثم يُفعّل كولداون للطلبات التالية.
+    ثم يُفعّل كولداون للطلبات التالية. status=0 تعني خطأ اتصال/انقطاع.
     """
     global _quota_blocked_until
+    model = model or GEMINI_MODEL
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
+        f"{model}:generateContent"
     )
     req = urllib.request.Request(
         url,
@@ -435,11 +454,12 @@ def _llm_request(payload):
     )
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8")), resp.status
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         logger.error(
-            "Gemini رفض الطلب (HTTP %s) — تفاصيل جوجل:\n%s",
+            "Gemini رفض الطلب (%s) HTTP %s — تفاصيل جوجل:\n%s",
+            model,
             exc.code,
             detail[:3000],
         )
@@ -450,7 +470,7 @@ def _llm_request(payload):
             time.sleep(delay)
             try:
                 with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    return json.loads(resp.read().decode("utf-8")), resp.status
             except Exception as exc2:  # noqa: BLE001
                 logger.error("إعادة المحاولة بعد 429 فشلت: %s:%s",
                              type(exc2).__name__, exc2)
@@ -459,11 +479,40 @@ def _llm_request(payload):
                     "حُجِبت استدعاءات LLM لمدة %ds بسبب استنداد الحصة المجانية.",
                     int(_quota_cooldown),
                 )
-                return None
-        return None
+                return None, 429
+        return None, exc.code
     except Exception as exc:  # noqa: BLE001
-        logger.error("خطأ اتصال بـ Gemini: %s:%s", type(exc).__name__, exc)
-        return None
+        logger.error("خطأ اتصال بـ Gemini (%s): %s:%s", model,
+                     type(exc).__name__, exc)
+        return None, 0
+
+
+# كاش سلبي لنماذج التشكيل المرفوضة (404/403): النموذج الذي أقصته جوجل عن
+# مستخدميها (مثل gemini-2.5-flash) يُتجاهل لبرهة كي لا تُهدر رحلة-ذهاب في كل
+# طلب ولا يمتلئ السجل بتكرار نفس الخطأ. المفتاح = اسم النموذج.
+_diacrit_neg_cache = {}
+_diacrit_neg_lock = threading.Lock()
+
+
+def _diacrit_model_blocked(model):
+    with _diacrit_neg_lock:
+        until = _diacrit_neg_cache.get(model, 0.0)
+        if until > time.monotonic():
+            return True
+        if until:
+            _diacrit_neg_cache.pop(model, None)
+    return False
+
+
+def _block_diacrit_model(model, reason):
+    with _diacrit_neg_lock:
+        _diacrit_neg_cache[model] = time.monotonic() + GEMINI_DIACRIT_COOLDOWN
+    logger.warning(
+        "نموذج التشكيل %s يتعذّر (%s)؛ نتجاوزه لـ %is في الطلبات التالية.",
+        model,
+        reason,
+        int(GEMINI_DIACRIT_COOLDOWN),
+    )
 
 
 # تجميع نصوص متشابهة متكررة (التطبيق يطلب النص نفسه لاحقاً): ذاكرة مؤقتة بحدّ زمني.
@@ -548,19 +597,29 @@ def _llm_cached(text):
 
 
 def _llm_diacritize(text):
-    """استدعاء Gemini عبر REST (stdlib — بلا حزمة ثقيلة) وإرجاع النص المشكَّل."""
+    """استدعاء Gemini عبر REST (stdlib — بلا حزمة ثقيلة) وإرجاع النص المشكَّل.
+
+    يُجرّب GEMINI_DIACRIT_MODELS بالترتيب متخطياً المحجوب مؤقتاً (404/403) —
+    فمن يغيّر جوجل توافر نموذجه لا يُسقط التشكيل بعد عن CATT.
+    """
     payload = {
         "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
     }
-    data = _llm_request(payload)
-    if not data:
-        return None
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError, TypeError):
-        return None
+    for model in GEMINI_DIACRIT_MODELS:
+        if _diacrit_model_blocked(model):
+            continue
+        data, status = _llm_request(payload, model)
+        if data is None:
+            if status in (400, 403, 404, 429):
+                _block_diacrit_model(model, f"HTTP {status}")
+            continue
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError, TypeError):
+            return None
+    return None
 
 
 def _llm_diacritize_safe(text):
@@ -1596,6 +1655,9 @@ def tts_status():
 
 # شحن كاش LLM من القرص عند بدء التشغيل (لا يُهدر الحصة على النصوص المتكررة).
 _load_disk_cache()
+
+# إظهار سلّم النماذج في السجلات لتسهيل تشخيص اختيار نموذج التشكيل.
+logger.info("Gemini diacrit model ladder: %s", " | ".join(GEMINI_DIACRIT_MODELS))
 
 
 if __name__ == "__main__":

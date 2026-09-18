@@ -11,6 +11,10 @@ Endpoints جديدة (إضافية، اختيارية):
         معالجة سياقية كاملة: النص كاملاً يذهب إلى Gemini بنظام-تعليمات صارم (إعراب،
         التقاء ساكنين، ضرورات شعرية). عند غياب المفتاح/المهلة/الفشل → سقوط آلي إلى
         CATT (محرك ONNX محلي دقيق) ثم إلى محرك ONNX ثم النص الخام. لن يتوقف أبداً.
+        حقل اختياري في أي من هذه النقاط {..., "diacrit": "auto|llm|catt|onnx|raw"}
+        (أو معامل query diacrit=… في /audio/*) يقيد محركَ التشكيل باختيار أزرار
+        الجوال بدل "نظامي آلي": llm=Gemini، catt=CATT، onnx=المحرك الخفيف،
+        raw=بدون تشكيل (يُعاد النص كما هو). عند فشل المختار يكمل السلم نحو الأرخص.
     POST /tts-gemini  {"text": "...", "voice_name": "Aoede", "rate": 0} → صوت (audio/wav|audio/mpeg)
         المحرك الذكي: تشكيل سياقي (بالسقوط الآلي) ثم صوت Gemini الأصلي عبر
         responseModalities=["AUDIO"] + speechConfig.voiceName (Aoede/Charon/Fenrir/Kore/Puck).
@@ -675,26 +679,56 @@ def _llm_diacritize_safe(text):
     return out.strip() or None
 
 
-def context_diacritize(text):
+_DIACRIT_MODES = ("auto", "llm", "catt", "onnx", "raw")
+
+
+def _parse_diacrit_mode(value):
+    """يقرأ طلبَ المستخدم لمحرك التشكيل ويطبّعه: auto|llm|catt|onnx|raw.
+
+    أسماء مرادفة مقبولة: 'gemini'=llm (تجانس مع محرك النطق)، 'none'|'off'=raw.
+    أي قيمة أخرى تظل auto (السلّم الكامل) — لا نكسر الطلب أبداً.
+    """
+    v = (value or "").strip().lower()
+    if v in ("gemini", "llm"):
+        return "llm"
+    if v in ("none", "off", "raw", "no"):
+        return "raw"
+    if v in ("auto", "catt", "onnx"):
+        return v
+    return "auto"
+
+
+def context_diacritize(text, requested=None):
     """سلسلة السقوط الآلي: Gemini→CATT→ONNX→النص الخام. لا تعود None أبداً.
 
     نصٌّ شُكِّل سابقاً (مثل ما يرسله التطبيق بعد تشكيل CATT/ONNX) يمرّ كما هو
     بمرحلة "pass" دون أي استدعاء — يحفظ الحصة المجانية.
 
+    requested (اختياري): 'auto'|'llm'|'catt'|'onnx'|'raw' — يبدأ السلم من
+    المحرك الذي اختاره المستخدم صراحةً (أزرار الجوال) بدل "نظامي آلي". عند
+    فشل المختار يُكمل السلم نحو الأرخص (llm→catt→onnx→raw) فلا تتعطل القراءة.
+    'raw' (بدون تشكيل) يعيد النص كما هو فوراً دون أي معالجة محلية/بعيدة.
+
     تُرجع (النص المٌشكَّل، اسم المرحلة المستخدمة: llm|catt|onnx|pass|raw).
     """
+    mode = _parse_diacrit_mode(requested) if requested is not None else "auto"
+    if mode == "raw":
+        return text, "raw"
     if _looks_diacritized(text):
         return text, "pass"
-    llm_out = _llm_diacritize_safe(text)
-    if llm_out:
-        return llm_out, "llm"
-    catt_out = _catt_diacritize_safe(text)
-    if catt_out:
-        return catt_out, "catt"
-    try:
-        return get_diacritizer().diacritize(text), "onnx"
-    except Exception:
-        logger.error("فشل المحرك المحلي:\n%s", traceback.format_exc())
+    if mode in ("auto", "llm"):
+        llm_out = _llm_diacritize_safe(text)
+        if llm_out:
+            return llm_out, "llm"
+    if mode in ("auto", "catt"):
+        catt_out = _catt_diacritize_safe(text)
+        if catt_out:
+            return catt_out, "catt"
+    if mode in ("auto", "onnx"):
+        try:
+            return get_diacritizer().diacritize(text), "onnx"
+        except Exception:
+            logger.error("فشل المحرك المحلي:\n%s", traceback.format_exc())
     return text, "raw"
 
 
@@ -1344,7 +1378,7 @@ def _cartesia_tts_bytes(text, rate_pct):
     return audio
 
 
-def _synth_ladder(text, voice, rate, requested_engine=None):
+def _synth_ladder(text, voice, rate, requested_engine=None, diacrit=None):
     """سلم المحركات: تشكيل واحد ← Cartesia→Azure→Edge (حسب TTS_ENGINE).
 
     يعيد (audio|None, engine: cartesia|azure|edge, voice_used, diac_engine).
@@ -1355,6 +1389,8 @@ def _synth_ladder(text, voice, rate, requested_engine=None):
         (نطق مشكَّل ثم خام) — لا يتوقف مطلقاً، ويرفع أي صوت محترم بتفجيعات.
       • requested_engine (اختياري من التطبيق: auto|cartesia|azure|edge)
         يتجاوز TTS_ENGINE لهذا الطلب — ليدفع الجوال «Azure/Edge مباشرة».
+      • diacrit (اختياري من التطبيق: auto|llm|catt|onnx|raw) يقيّد محركَ
+        التشكيل ذاته (أزرار الجوال) دون تغيير بيئة الخادم.
     """
     req = (requested_engine or "").strip().lower()
     if req in ("cartesia", "azure", "edge"):
@@ -1367,7 +1403,7 @@ def _synth_ladder(text, voice, rate, requested_engine=None):
     preferred = base if base != "auto" else None
     candidates = ["cartesia", "azure"] if preferred is None else ([preferred] if preferred in (
         "cartesia", "azure") else [])
-    result, diac_engine = context_diacritize(text)
+    result, diac_engine = context_diacritize(text, diacrit)
     stripped = _strip_tashkeel(result)
 
     for name in candidates:
@@ -1412,7 +1448,10 @@ def audio_tts_get():
     voice = request.args.get("voice") or TTS_VOICE
     rate = _parse_rate(request.args.get("rate", "0"))
     requested = request.args.get("engine", "")
-    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate, requested)
+    diacrit = request.args.get("diacrit")
+    audio, engine, voice_used, diac_engine = _synth_ladder(
+        text, voice, rate, requested, diacrit
+    )
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
     resp = _audio_response(audio, "audio/mpeg")
@@ -1449,16 +1488,18 @@ def audio_tts_gemini():
             or GEMINI_AUDIO_VOICE
         ).strip()
         rate = data.get("rate", request.args.get("rate", "0"))
+        diacrit = data.get("diacrit", request.args.get("diacrit"))
     else:
         text = (request.args.get("text") or "").strip()
         voice = (request.args.get("voice_name") or GEMINI_AUDIO_VOICE).strip()
         rate = request.args.get("rate", "0")
+        diacrit = request.args.get("diacrit")
     rate_pct = _parse_rate(rate)
     if not text:
         return jsonify({"error": "empty text"}), 400
 
-    # تشكيل سياقي (نص كامل) مع سقوط آلي حتى الخام.
-    result, diac_engine = context_diacritize(text)
+    # تشكيل سياقي (نص كامل) مع سقوط آلي حتى الخام — يحترم اختيار الجوال إذا أُرسل.
+    result, diac_engine = context_diacritize(text, _parse_diacrit_mode(diacrit))
 
     # جرّب صوت Gemini الأصلي (نموذج TTS إن كان مفعّلاً لمفتاحك).
     audio_mime = _gemini_audio(result, voice)
@@ -1506,7 +1547,7 @@ def tashkeel():
         # نص بلا حروف عربية: يُعاد كما هو دون تشكيل (مكافئ FR-4)
         return jsonify({"diacritized": text, "engine": "pass"})
     try:
-        result, engine = context_diacritize(text)
+        result, engine = context_diacritize(text, _parse_diacrit_mode(data.get("diacrit")))
         out = {"diacritized": result}
         if engine:
             out["engine"] = engine
@@ -1525,7 +1566,7 @@ def tashkeel_context():
         return jsonify({"error": "empty text"}), 400
     if not is_arabic_text(text):
         return jsonify({"diacritized": text, "engine": "pass"})
-    result, engine = context_diacritize(text)
+    result, engine = context_diacritize(text, _parse_diacrit_mode(data.get("diacrit")))
     return jsonify({"diacritized": result, "engine": engine})
 
 
@@ -1561,8 +1602,11 @@ def tts_endpoint():
     voice = data.get("voice") or TTS_VOICE
     rate = _parse_rate(data.get("rate", "0"))
     requested = str(data.get("engine") or "")
+    diacrit = data.get("diacrit")
 
-    audio, engine, voice_used, diac_engine = _synth_ladder(text, voice, rate, requested)
+    audio, engine, voice_used, diac_engine = _synth_ladder(
+        text, voice, rate, requested, diacrit
+    )
     if audio is None:
         return jsonify({"error": "tts synthesis failed"}), 500
 

@@ -98,14 +98,20 @@ EDGE_PROSOBY_STYLE = (
 # ── محركات الصوت الإضافية (حصص مجانية متجددة شهرية) ─────────────────────────
 # Azure Speech F0 (500K حرف/شهر — دائم) + Cartesia Sonic 3.6 (20K حرف/شهر).
 # المفاتيح سيرفر-محض عبر envs Render فقط؛ لا تُرسل للموّبايل ولا تُسجَّل.
-AZURE_TTS_KEY = os.environ.get("AZURE_TTS_KEY", "").strip()
-AZURE_REGION = os.environ.get("AZURE_REGION", "").strip().lower()
+AZURE_TTS_KEY = (
+    os.environ.get("AZURE_TTS_KEY", "") or os.environ.get("AZURE_SPEECH_KEY", "")
+).strip()
+AZURE_REGION = (
+    os.environ.get("AZURE_REGION", "") or os.environ.get("AZURE_SPEECH_REGION", "")
+).strip().lower()
 AZURE_TTS_VOICE = os.environ.get("AZURE_TTS_VOICE", "ar-EG-ShakirNeural").strip()
 AZURE_MAX_CHARS = int(float(os.environ.get("AZURE_MAX_CHARS", "4000")))
 AZURE_TIMEOUT = float(os.environ.get("AZURE_TIMEOUT", "40"))
 AZURE_COOLDOWN = float(os.environ.get("AZURE_COOLDOWN", "900"))
 
-CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY", "").strip()
+CARTESIA_API_KEY = (
+    os.environ.get("CARTESIA_API_KEY", "") or os.environ.get("CARTESIA_KEY", "")
+).strip()
 CARTESIA_VOICE_ID = os.environ.get("CARTESIA_VOICE_ID", "").strip()
 CARTESIA_MAX_CHARS = int(float(os.environ.get("CARTESIA_MAX_CHARS", "2000")))
 CARTESIA_TIMEOUT = float(os.environ.get("CARTESIA_TIMEOUT", "30"))
@@ -1050,9 +1056,26 @@ def _parse_rate(value):
 
 def _azure_enabled():
     """Azure محرّك متاح فقط إن وُجد المفتاح والمنطقة (سيرفر-محض) مع اسم منطقة آمن."""
-    return bool(AZURE_TTS_KEY and AZURE_REGION) and (
-        re.fullmatch(r"[a-z0-9-]+", AZURE_REGION) is not None
-    )
+    return _azure_gate_reason() == ""
+
+
+def _azure_gate_reason():
+    """سبب تعذّر استخدام Azure (للتوثيق في السجلات — لا يُكشف أي مفتاح).
+
+    يرصد الاسمين المحتملين من بيئة التشغيل (AZURE_TTS_KEY/AZURE_SPEECH_KEY و
+    AZURE_REGION/AZURE_SPEECH_REGION) حتى يظهر للمشغّل بالضبط أي متغير ناقص.
+    """
+    key = os.environ.get("AZURE_TTS_KEY", "") or os.environ.get("AZURE_SPEECH_KEY", "")
+    region = (
+        os.environ.get("AZURE_REGION", "") or os.environ.get("AZURE_SPEECH_REGION", "")
+    ).strip().lower()
+    if not key:
+        return "AZURE_TTS_KEY (أو AZURE_SPEECH_KEY) غير مضبوط في بيئة السيرفر"
+    if not region:
+        return "AZURE_REGION (أو AZURE_SPEECH_REGION) غير مضبوط في بيئة السيرفر"
+    if re.fullmatch(r"[a-z0-9-]+", region) is None:
+        return f"AZURE_REGION صيغتها غير آمنة: {region!r}"
+    return ""
 
 
 def _azure_ssml(text, voice, rate_pct):
@@ -1077,7 +1100,19 @@ def _azure_tts_bytes(text, rate_pct):
     أي خطأ يُدخل المحرك كولداوناً سلبياً (لا تُهدر مهل ناجية مع محرك ميت).
     العداد الشهري يُشحن فقط بعد نجاح فعلي (F0 لا يُفوَّر أبداً).
     """
-    if not _azure_enabled() or _engine_soft_stopped("azure") or _engine_blocked("azure"):
+    gate = _azure_gate_reason()
+    if gate:
+        logger.warning("Azure غير متاح: %s — سيُكمل السلم إلى Edge.", gate)
+        return None
+    if _engine_soft_stopped("azure"):
+        logger.warning("Azure مستنفد الحصة الشهرية (توقف ناعم)؛ نتجاوز إلى Edge.")
+        return None
+    if _engine_blocked("azure"):
+        used, quota, pct, _ = _engine_budget_state("azure")
+        logger.info(
+            "Azure في كولداون سلبي بعد فشل سابق (نسبة الحصة %s%%)؛ نتجاوز إلى Edge.",
+            round(pct * 100, 1),
+        )
         return None
     if len(text) > AZURE_MAX_CHARS:
         logger.info("نص فوق %d حرفاً؛ نتجاوز Azure إلى Edge.", AZURE_MAX_CHARS)
@@ -1165,7 +1200,21 @@ def _cartesia_tts_bytes(text, rate_pct):
 
     النص يُجرَّد من علامات التشكيل (حروف مُفوترة أقل). أي خطأ يُدخل كولداوناً.
     """
-    if not CARTESIA_API_KEY or _engine_soft_stopped("cartesia") or _engine_blocked("cartesia"):
+    if not CARTESIA_API_KEY:
+        logger.warning(
+            "Cartesia غير متاح: CARTESIA_API_KEY غير مضبوط في بيئة السيرفر "
+            "— سيُكمل السلم إلى Azure/Edge."
+        )
+        return None
+    if _engine_soft_stopped("cartesia"):
+        logger.warning("Cartesia مستنفد الحصة الشهرية (توقف ناعم)؛ نتجاوز إلى Azure/Edge.")
+        return None
+    if _engine_blocked("cartesia"):
+        used, quota, pct, _ = _engine_budget_state("cartesia")
+        logger.info(
+            "Cartesia في كولداون سلبي بعد فشل سابق (نسبة الحصة %s%%)؛ نتجاوز إلى Azure/Edge.",
+            round(pct * 100, 1),
+        )
         return None
     voice_id = _cartesia_voice_id()
     if not voice_id:
@@ -1251,6 +1300,11 @@ def _synth_ladder(text, voice, rate, requested_engine=None):
             audio = _azure_tts_bytes(stripped, rate)
             if audio is not None:
                 return audio, "azure", AZURE_TTS_VOICE, diac_engine
+    if preferred in ("cartesia", "azure"):
+        logger.warning(
+            "المحرك المطلوب %s لم يُنتج صوتاً رغم توافره؛ السقوط الآلي إلى Edge.",
+            preferred,
+        )
 
     voice_used = _edge_voice(voice)
     audio = synthesize(result, voice_used, rate)

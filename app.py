@@ -25,6 +25,8 @@ Endpoints جديدة (إضافية، اختيارية):
     GEMINI_DIACRIT_MODELS قائمة نماذج تشكيل احتياطية مفصولة بفواصل؛ تُجرَّب بعد
                         GEMINI_MODEL عند رفضه (404/403) مع كاش حجب مؤقت
     GEMINI_DIACRIT_COOLDOWN كولداون النموذج المرفوض بالثواني، افتراضي 600
+    GEMINI_QUOTA_COOLDOWN مدة حجب LLM بعد نفاد الحصة اليومية (429)، افتراضي 3600
+    GEMINI_RATE_COOLDOWN مدة حجب LLM بعد فائض طلبات الدقيقة (RATE_LIMIT)، افتراضي 75
     GEMINI_TIMEOUT   مهلة الاستدعاء بالثواني، افتراضي 25
     GEMINI_MAX_CHARS حدّ أقصى لأحرف نص LLM، فوقه سقوط فوري إلى ONNX، افتراضي 1500
     CATT_MAX_CHARS   حدّ CATT لكل قطعة ONNX، افتراضي 1024 (سقف النموذج)
@@ -102,6 +104,11 @@ GEMINI_DIACRIT_MODELS = list(dict.fromkeys([
 GEMINI_DIACRIT_COOLDOWN = float(os.environ.get("GEMINI_DIACRIT_COOLDOWN", "600"))
 GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
 MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1500"))
+# مُدَدُ الحجب بعد 429: نفاد الحصة اليومية = فترة طويلة (ساعة افتراضياً)؛
+# بينما فائض الطلبات في الدقيقة (RATE_LIMIT) يُحلّ خلال دقيقة ≈ دمَ قصير
+# (75s افتراضياً) حتى لا يكبّل انفجار طلباتٍ واحداً مسار LLM طوال ساعة.
+GEMINI_QUOTA_COOLDOWN = float(os.environ.get("GEMINI_QUOTA_COOLDOWN", "3600"))
+GEMINI_RATE_COOLDOWN = float(os.environ.get("GEMINI_RATE_COOLDOWN", "75"))
 
 TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-EG-ShakirNeural").strip()
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
@@ -474,10 +481,23 @@ def _llm_request(payload, model=None):
             except Exception as exc2:  # noqa: BLE001
                 logger.error("إعادة المحاولة بعد 429 فشلت: %s:%s",
                              type(exc2).__name__, exc2)
-                _quota_blocked_until = time.monotonic() + _quota_cooldown
+                # قراءة REASON من جسم جوجل: RATE_LIMIT (فائض دقيقة، يُحلّ
+                # خلال دقيقة) مقابل نفاد الحصة اليومية (يتطلب ساعة أو أكثر).
+                reason = "QUOTA"
+                try:
+                    _j = json.loads(detail or "{}")
+                    for _det in ((_j.get("error") or {}).get("details") or []):
+                        if _det.get("reason"):
+                            reason = _det.get("reason")
+                except Exception:  # noqa: BLE001
+                    pass
+                is_rate = "RATE_LIMIT" in reason.upper()
+                cooldown = GEMINI_RATE_COOLDOWN if is_rate else GEMINI_QUOTA_COOLDOWN
+                _quota_blocked_until = time.monotonic() + cooldown
                 logger.warning(
-                    "حُجِبت استدعاءات LLM لمدة %ds بسبب استنداد الحصة المجانية.",
-                    int(_quota_cooldown),
+                    "حُجِبت استدعاءات LLM لمدة %ds (%s).",
+                    int(cooldown),
+                    reason,
                 )
                 return None, 429
         return None, exc.code
@@ -522,7 +542,7 @@ _LLM_CACHE_TTL = 600.0
 
 # ── كولداون الحصة المجانية (quota-blocked): حفظ 429 يمنع استدعاءات LLM مؤقتاً ──
 _quota_blocked_until = 0.0
-_quota_cooldown = 3600.0  # ساعة واحدة بعد استنفاد الحصة
+_quota_cooldown = GEMINI_QUOTA_COOLDOWN  # احتياطي لنفاد الحصة اليومية
 
 # ── كاش LLM على القرص (JSON بسيط، يشحن مع start): ──
 _LLM_DISK_PATH = os.environ.get("LLM_CACHE_PATH", os.path.join(

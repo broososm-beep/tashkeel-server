@@ -868,15 +868,18 @@ def context_diacritize(text, requested=None):
         llm_out = _llm_diacritize_safe(text)
         if llm_out:
             return llm_out, "llm"
-    if mode in ("auto", "catt"):
+    if mode in ("auto", "catt") and CATT_SUBMIT_MAX > 0:
         catt_out = _catt_diacritize_safe(text)
         if catt_out:
             return catt_out, "catt"
-    if mode in ("auto", "onnx"):
+    if mode in ("auto", "onnx") or (mode == "catt" and CATT_SUBMIT_MAX <= 0):
+        # CATT مُعطَّل افتراضياً (القياس: >60s حتى لـ 250 حرفاً على CPU
+        # Render) — الطلبُ الصريح له يهبط على ONNX لا على النص الخام.
         try:
             return get_diacritizer().diacritize(text), "onnx"
         except Exception:
             logger.error("فشل المحرك المحلي:\n%s", traceback.format_exc())
+        return text, "raw"
     return text, "raw"
 
 

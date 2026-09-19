@@ -163,6 +163,10 @@ CATT_TIMEOUT = float(os.environ.get("CATT_TIMEOUT", "60"))
 # مباشرة إلى ONNX لأن معالجة CATT التسلسلية على وحدات Render المجانية تتجاوز
 # مهلة العميل (60s) فيعود التطبيق بـ TimeoutException رغم نجاح الخادم لاحقاً.
 CATT_FAST_LIMIT = int(float(os.environ.get("CATT_FAST_LIMIT", "8000")))
+
+# ذاكرة تخزين مؤقتة للنتائج: نفس النص/الوضع يُعاد فورياً دون إعادة تشكيل.
+DIACRIT_CACHE_SIZE = int(os.environ.get("DIACRIT_CACHE_SIZE", "300"))
+DIACRIT_CACHE_LIMIT = int(os.environ.get("DIACRIT_CACHE_LIMIT", "8000"))
 # حدّ أدنى لاعتبار نتيجة CATT مشكَّلة (مثلاً النص الخام القصير يبقى بلا تنوين ظاهر).
 CATT_MIN_LEN = int(float(os.environ.get("CATT_MIN_LEN", "0")))
 
@@ -1550,6 +1554,27 @@ def audio_tts_gemini():
 # ════════════════════════════════════════════════════════════════
 
 
+_DIACRIT_CACHE_LOCK = threading.Lock()
+_DIACRIT_CACHE = {}
+
+
+def _diacrit_cached(text, mode):
+    """نتيجة التشكيل مع تخزين مؤقت (نفس المحتوى → فوري؛ يخفف عبء CATT/LLM)."""
+    if DIACRIT_CACHE_LIMIT and len(text) > DIACRIT_CACHE_LIMIT:
+        return context_diacritize(text, mode)
+    key = (mode, text)
+    with _DIACRIT_CACHE_LOCK:
+        hit = _DIACRIT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    result = context_diacritize(text, mode)
+    with _DIACRIT_CACHE_LOCK:
+        if len(_DIACRIT_CACHE) >= DIACRIT_CACHE_SIZE:
+            _DIACRIT_CACHE.pop(next(iter(_DIACRIT_CACHE)))
+        _DIACRIT_CACHE[key] = result
+    return result
+
+
 @app.route("/tashkeel", methods=["POST"])
 def tashkeel():
     """العقد الإلزامي القديم — توافق كامل مع تطبيق الموبايل، بدقة أعلى الآن.
@@ -1566,7 +1591,7 @@ def tashkeel():
         # نص بلا حروف عربية: يُعاد كما هو دون تشكيل (مكافئ FR-4)
         return jsonify({"diacritized": text, "engine": "pass"})
     try:
-        result, engine = context_diacritize(text, _parse_diacrit_mode(data.get("diacrit")))
+        result, engine = _diacrit_cached(text, _parse_diacrit_mode(data.get("diacrit")))
         out = {"diacritized": result}
         if engine:
             out["engine"] = engine

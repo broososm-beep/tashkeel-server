@@ -61,6 +61,7 @@ Endpoints جديدة (إضافية، اختيارية):
 """
 import asyncio
 import base64
+import datetime
 import io
 import json
 import logging
@@ -101,8 +102,9 @@ GEMINI_DIACRIT_MODELS = list(dict.fromkeys([
     *[m.strip() for m in os.environ.get("GEMINI_DIACRIT_MODELS", "").split(",")
       if m.strip()],
     "gemini-3.6-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]))
 # كولداون النموذج المرفوض (ثوانٍ) — بعده يُعاد تجربته.
 GEMINI_DIACRIT_COOLDOWN = float(os.environ.get("GEMINI_DIACRIT_COOLDOWN", "600"))
@@ -498,6 +500,22 @@ def _llm_request(payload, model=None):
             detail[:3000],
         )
         if exc.code == 429:
+            # كشف الحصة اليومية لكل نموذج (…PerDayPerProjectPerModel) في جسم
+            # جوجل: تجدّد عند منتصف ليل المحيط الهادئ — نحجب هذا النموذج وحده
+            # دون إعادة محاولة (لا معنى لها) ودون حجب LLM كله؛ بقية النماذج تكمل.
+            daily = False
+            try:
+                _j = json.loads(detail or "{}")
+                for _det in ((_j.get("error") or {}).get("details") or []):
+                    _qid = (_det.get("quotaViolations") or [{}])[0].get("quotaId") or ""
+                    if "PerDay" in _qid or "PerProjectPerModel" in _qid:
+                        daily = True
+                        break
+            except Exception:  # noqa: BLE001
+                daily = False
+            if daily:
+                _block_model_daily_quota(model)
+                return None, 429
             m = re.search(r"retry in (\d+(?:\.\d+)?)s", detail or "", re.I)
             delay = min(float(m.group(1)), 8.0) if m else 2.0
             logger.warning("استنفدت الحصة المجانية؛ إعادة المحاولة بعد %.1fs.", delay)
@@ -512,8 +530,8 @@ def _llm_request(payload, model=None):
                 # خلال دقيقة) مقابل نفاد الحصة اليومية (يتطلب ساعة أو أكثر).
                 reason = "QUOTA"
                 try:
-                    _j = json.loads(detail or "{}")
-                    for _det in ((_j.get("error") or {}).get("details") or []):
+                    _j2 = json.loads(detail or "{}")
+                    for _det in ((_j2.get("error") or {}).get("details") or []):
                         if _det.get("reason"):
                             reason = _det.get("reason")
                 except Exception:  # noqa: BLE001
@@ -546,19 +564,76 @@ def _diacrit_model_blocked(model):
         until = _diacrit_neg_cache.get(model, 0.0)
         if until > time.monotonic():
             return True
-        if until:
+        if until and until != float("inf"):
             _diacrit_neg_cache.pop(model, None)
+    with _model_quota_lock:
+        q_until = _model_quota_until.get(model, 0.0)
+        if q_until > time.monotonic():
+            return True
     return False
 
 
-def _block_diacrit_model(model, reason):
+def _block_diacrit_model(model, reason, permanent=False):
+    """حجب نموذج تشكيل؛ 404/410 نهائي (float("inf")), غيره مؤقت بـ 600s."""
     with _diacrit_neg_lock:
-        _diacrit_neg_cache[model] = time.monotonic() + GEMINI_DIACRIT_COOLDOWN
+        _diacrit_neg_cache[model] = (float("inf") if permanent
+                                     else time.monotonic() + GEMINI_DIACRIT_COOLDOWN)
+    if permanent:
+        logger.warning(
+            "نموذج التشكيل %s لم يعد متاحاً (%s)؛ يُتجاهل نهائياً حتى الإقلاع التالي.",
+            model,
+            reason,
+        )
+    else:
+        logger.warning(
+            "نموذج التشكيل %s يتعذّر (%s)؛ نتجاوزه لـ %is في الطلبات التالية.",
+            model,
+            reason,
+            int(GEMINI_DIACRIT_COOLDOWN),
+        )
+
+
+# ── حصة اليومية لكل نموذج (تتجدّد عند 00:00 بالمحيط الهادئ) ───────────────────
+# الحصة المجانية 20/يوم/لكل نموذج/لكل مشروع (…PerDayPerProjectPerModel). بحجب
+# النموذج الواحد فقط نحافظ على بقية النماذج الصالحة (لكلٍّ حصته) لبقية اليوم.
+_model_quota_until = {}
+_model_quota_lock = threading.Lock()
+
+
+def _seconds_until_pacific_midnight():
+    """ثوانٍ حتى منتصف ليل المحيط الهادئ (بمراعاة التوقيت الصيفي الأمريكي)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    y, m = now.year, now.month
+
+    def _us_dst():
+        # DST: من ثاني أحد مارس (02:00) حتى أول أحد نوفمبر (02:00).
+        if m < 3 or m > 11:
+            return False
+        if m == 3:
+            first = datetime.date(y, 3, 1)
+            second_sun = first + datetime.timedelta(days=(6 - first.weekday()) % 7 + 7)
+            return now.date() >= second_sun
+        if m == 11:
+            first = datetime.date(y, 11, 1)
+            first_sun = first + datetime.timedelta(days=(6 - first.weekday()) % 7)
+            return now.date() < first_sun
+        return True
+
+    offset = datetime.timedelta(hours=7 if _us_dst() else 8)
+    pt_now = now - offset
+    next_mid_pt = (pt_now.replace(hour=0, minute=0, second=0, microsecond=0)
+                   + datetime.timedelta(days=1))
+    return max((next_mid_pt + offset - now).total_seconds() + 60.0, 60.0)
+
+
+def _block_model_daily_quota(model):
+    """عند 429 بالحصة اليومية: نحجب هذا النموذج وحده حتى منتصف ليل Pacific."""
+    with _model_quota_lock:
+        _model_quota_until[model] = time.monotonic() + _seconds_until_pacific_midnight()
     logger.warning(
-        "نموذج التشكيل %s يتعذّر (%s)؛ نتجاوزه لـ %is في الطلبات التالية.",
+        "نفدت حصة %s اليومية المجانية؛ محجوب حتى منتصف ليل المحيط الهادئ — "
+        "بقية النماذج تكمل.",
         model,
-        reason,
-        int(GEMINI_DIACRIT_COOLDOWN),
     )
 
 
@@ -659,7 +734,9 @@ def _llm_diacritize(text):
             continue
         data, status = _llm_request(payload, model)
         if data is None:
-            if status in (400, 403, 404, 429):
+            if status in (404, 410):
+                _block_diacrit_model(model, f"HTTP {status}", permanent=True)
+            elif status in (400, 403, 429):
                 _block_diacrit_model(model, f"HTTP {status}")
             continue
         try:

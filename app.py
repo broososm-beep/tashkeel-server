@@ -112,8 +112,11 @@ GEMINI_DIACRIT_MODELS = list(dict.fromkeys([
 ]))
 # كولداون النموذج المرفوض (ثوانٍ) — بعده يُعاد تجربته.
 GEMINI_DIACRIT_COOLDOWN = float(os.environ.get("GEMINI_DIACRIT_COOLDOWN", "600"))
-GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
-MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1500"))
+GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "22"))
+# قياسٌ حيّ (2026-09): Gemini ~26.8s لـ 250 حرفاً على حصةٍ محجوبة غالباً؛
+# لذلك حدّ LLM النصي الافتراضي يُخرَج على 1100 حرفاً — النصوص الأطول تذهب
+# مباشرة إلى ONNX (0.63ms/حرف) دون انتظار LLM. أي قيمة بيئة تبقى مرجعاً.
+MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1100"))
 # مُدَدُ الحجب بعد 429: نفاد الحصة اليومية = فترة طويلة (ساعة افتراضياً)؛
 # بينما فائض الطلبات في الدقيقة (RATE_LIMIT) يُحلّ خلال دقيقة ≈ دمَ قصير
 # (75s افتراضياً) حتى لا يكبّل انفجار طلباتٍ واحداً مسار LLM طوال ساعة.
@@ -196,10 +199,12 @@ CATT_TIMEOUT = float(os.environ.get("CATT_TIMEOUT", "60"))
 CATT_FAST_LIMIT = int(float(os.environ.get("CATT_FAST_LIMIT", "3000")))
 # حد الانشغال الفردي: عامل النقل واحد (max_workers=1) وله حد زمني لا يُلغي
 # المهمة — أي مهمة تنتهي فوق مهلة العميل تبقى معلّقةٍ في العامل الوحيد وتُسمم
-# كلَ الطلبات اللاحقة (شوهد 90s×2 + توقف الكل). لذلك أي نص أطول من حد الإرسال
-# يُتجاوز فوراً إلى ONNX دون شغل العامل: مهمةٌ مرسلة أصغر من الحَد = سيقتها
-# زمنياً مقبولة حتى لو ضاعت من العميل. (صفحات تطبيق قارئ ≤540 حرفاً تمر.)
-CATT_SUBMIT_MAX = int(float(os.environ.get("CATT_SUBMIT_MAX", "1200")))
+# كلَ الطلبات اللاحقة (شوهد 60s لكل طلب على التوالي، وحتى /tts/status يتجمد
+# مع كل طلب معلّق). القياس الحي 2026-09: CATT يتجاوز 60s حتى لـ 250 حرفاً على
+# معالج Render المجاني، فصار الافتراضي 0 = تعطيل CATT تماماً (السلّم يقفز إلى
+# ONNX فوراً). يعاد تفعيله فقط برفع حد الإرسال (CATT_SUBMIT_MAX=700 مثلاً)
+# متى كانت الوحدة أسرع. مهمةٌ مرسلة أصغر من الحَد = سيقتها زمنياً مقبولة.
+CATT_SUBMIT_MAX = int(float(os.environ.get("CATT_SUBMIT_MAX", "0")))
 
 # ذاكرة تخزين مؤقتة للنتائج: نفس النص/الوضع يُعاد فورياً دون إعادة تشكيل.
 DIACRIT_CACHE_SIZE = int(os.environ.get("DIACRIT_CACHE_SIZE", "300"))

@@ -171,6 +171,12 @@ CATT_TIMEOUT = float(os.environ.get("CATT_TIMEOUT", "60"))
 # مباشرة إلى ONNX لأن معالجة CATT التسلسلية على وحدات Render المجانية تتجاوز
 # مهلة العميل (60s) فيعود التطبيق بـ TimeoutException رغم نجاح الخادم لاحقاً.
 CATT_FAST_LIMIT = int(float(os.environ.get("CATT_FAST_LIMIT", "3000")))
+# حد الانشغال الفردي: عامل النقل واحد (max_workers=1) وله حد زمني لا يُلغي
+# المهمة — أي مهمة تنتهي فوق مهلة العميل تبقى معلّقةٍ في العامل الوحيد وتُسمم
+# كلَ الطلبات اللاحقة (شوهد 90s×2 + توقف الكل). لذلك أي نص أطول من حد الإرسال
+# يُتجاوز فوراً إلى ONNX دون شغل العامل: مهمةٌ مرسلة أصغر من الحَد = سيقتها
+# زمنياً مقبولة حتى لو ضاعت من العميل. (صفحات تطبيق قارئ ≤540 حرفاً تمر.)
+CATT_SUBMIT_MAX = int(float(os.environ.get("CATT_SUBMIT_MAX", "1200")))
 
 # ذاكرة تخزين مؤقتة للنتائج: نفس النص/الوضع يُعاد فورياً دون إعادة تشكيل.
 DIACRIT_CACHE_SIZE = int(os.environ.get("DIACRIT_CACHE_SIZE", "300"))
@@ -452,9 +458,12 @@ def _catt_diacritize_safe(text):
     """مسار CATT بمهلة زمنية صارمة؛ أي فشل/مهلة → None (فيُفعَّل ما بعده)."""
     if not text or not is_arabic_text(text):
         return None
-    if len(text) > CATT_FAST_LIMIT:
-        logger.info("نص طويل (%d حرفاً)؛ نتخطى CATT إلى المحرك التالي (حد الأمان).",
-                    len(text))
+    if len(text) > CATT_SUBMIT_MAX:
+        logger.info(
+            "نص كبير (%d حرفاً > حد الإرسال %d)؛ نتخطى CATT إلى ONNX "
+            "حتى لا يعلق عاملُ الوحدة الوحيد خلف مهمةٍ طويلة.",
+            len(text), CATT_SUBMIT_MAX,
+        )
         return None
     try:
         fut = _catt_pool.submit(_catt_diacritize, text)

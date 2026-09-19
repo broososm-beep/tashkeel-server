@@ -159,6 +159,10 @@ _ENGINE_SOFT_STOP_RATIO = 0.95
 # مرة واحدة من GitHub Releases ثم يُخزَّن محلياً؛ سقف النموذج 1024 حرفاً.
 CATT_MAX_CHARS = int(float(os.environ.get("CATT_MAX_CHARS", "1024")))
 CATT_TIMEOUT = float(os.environ.get("CATT_TIMEOUT", "60"))
+# حدّ أمان زمني: نصوص أطول من CATT_FAST_LIMIT (خاصة الكبيرة/المختلطة) تُتجاوز
+# مباشرة إلى ONNX لأن معالجة CATT التسلسلية على وحدات Render المجانية تتجاوز
+# مهلة العميل (60s) فيعود التطبيق بـ TimeoutException رغم نجاح الخادم لاحقاً.
+CATT_FAST_LIMIT = int(float(os.environ.get("CATT_FAST_LIMIT", "2000")))
 # حدّ أدنى لاعتبار نتيجة CATT مشكَّلة (مثلاً النص الخام القصير يبقى بلا تنوين ظاهر).
 CATT_MIN_LEN = int(float(os.environ.get("CATT_MIN_LEN", "0")))
 
@@ -362,6 +366,20 @@ def _get_catt_model():
     return _catt_model
 
 
+def _warm_catt_model():
+    """تحميل كسول مُبكّر: يُحمَّل النموذج في خلفية الإقلاع كي لا يدفع أول طلب
+    لاحق زمنَ تحميل ~74MB/20-25s داخل مهلته، فيصير CATT هكذا جاهزاً فوراً."""
+    try:
+        _get_catt_model()
+        logger.info("تم إحماء نموذج CATT عند الإقلاع.")
+    except Exception:  # noqa: BLE001
+        logger.warning("فشل إحماء CATT عند الإقلاع؛ يُحمَّل كسولاً عند أول حاجة.")
+
+
+threading.Thread(target=_warm_catt_model, daemon=True,
+                 name="catt-warm").start()
+
+
 def _catt_chunks(segment):
     """يقسّم مقطعاً عربياً (قد يعلو عن حد النموذج) إلى قطع ≤ CATT_MAX_CHARS على حدود الكلمات."""
     segment = segment.strip()
@@ -417,8 +435,9 @@ def _catt_diacritize_safe(text):
     """مسار CATT بمهلة زمنية صارمة؛ أي فشل/مهلة → None (فيُفعَّل ما بعده)."""
     if not text or not is_arabic_text(text):
         return None
-    if len(text) > CATT_MAX_CHARS * 8:
-        logger.info("نص طويل (%d حرفاً)؛ نتخطى CATT إلى المحرك التالي.", len(text))
+    if len(text) > CATT_FAST_LIMIT:
+        logger.info("نص طويل (%d حرفاً)؛ نتخطى CATT إلى المحرك التالي (حد الأمان).",
+                    len(text))
         return None
     try:
         fut = _catt_pool.submit(_catt_diacritize, text)

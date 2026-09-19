@@ -1829,9 +1829,12 @@ def _translate_to_arabic(text, to):
     )
     headers = {
         "Ocp-Apim-Subscription-Key": MICROSOFT_TRANSLATOR_KEY,
-        "Ocp-Apim-Subscription-Region": MICROSOFT_TRANSLATOR_REGION,
         "Content-Type": "application/json",
     }
+    # توثيق Microsoft: تُرسَل Ocp-Apim-Subscription-Region فقط لموردٍ إقليمي؛
+    # مورد «global» يُعارضها (401) — إذن نوجّهها لمنطقة فقط، ونحذفها لـ global.
+    if MICROSOFT_TRANSLATOR_REGION and MICROSOFT_TRANSLATOR_REGION.lower() != "global":
+        headers["Ocp-Apim-Subscription-Region"] = MICROSOFT_TRANSLATOR_REGION
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=TRANSLATE_TIMEOUT) as resp:
@@ -1839,7 +1842,11 @@ def _translate_to_arabic(text, to):
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         logger.error("ترجمة Microsoft رفضت (HTTP %s) — %s", exc.code, detail[:300])
-        return None, f"الخادم رفض الترجمة (HTTP {exc.code})"
+        if exc.code == 401:
+            hint = "تحقق من مفتاح المترجم (مورد Translator لا Speech) ومنطقة المورد"
+        else:
+            hint = ""
+        return None, f"الخادم رفض الترجمة (HTTP {exc.code}){(' — ' + hint) if hint else ''}"
     except Exception as exc:  # noqa: BLE001
         logger.error("خطأ اتصال بخدمة الترجمة: %s:%s", type(exc).__name__, exc)
         return None, "تعذّر الاتصال بخدمة الترجمة"

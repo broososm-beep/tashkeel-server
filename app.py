@@ -122,6 +122,9 @@ MAX_LLM_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "1100"))
 # (75s افتراضياً) حتى لا يكبّل انفجار طلباتٍ واحداً مسار LLM طوال ساعة.
 GEMINI_QUOTA_COOLDOWN = float(os.environ.get("GEMINI_QUOTA_COOLDOWN", "3600"))
 GEMINI_RATE_COOLDOWN = float(os.environ.get("GEMINI_RATE_COOLDOWN", "75"))
+# مفتاح «LLM داخل مسار auto» — معطَّل افتراضياً لسرعة أول صوت (القياس: Gemini
+# ~27-29s حتى لـ 600 حرفاً). الوضع الصريح 'llm' لا يتأثر به أبداً.
+LLM_IN_AUTO = os.environ.get("LLM_IN_AUTO", "0").strip().lower() in ("1", "true", "yes")
 
 TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-EG-ShakirNeural").strip()
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
@@ -864,7 +867,10 @@ def context_diacritize(text, requested=None):
         return text, "raw"
     if _looks_diacritized(text):
         return text, "pass"
-    if mode in ("auto", "llm"):
+    # LLM داخل "auto" افتراضياً معطَّل (القياس الحي: Gemini ~27-29s حتى لـ 600
+    # حرفاً — يُبطئ أول صوت). من يُريد جودة LLM تلقائياً يضبط LLM_IN_AUTO=1،
+    # أو يختار محرك 'llm' صراحةً من أزرار التطبيق (يبقى يعمل دائماً).
+    if mode == "llm" or (mode == "auto" and LLM_IN_AUTO):
         llm_out = _llm_diacritize_safe(text)
         if llm_out:
             return llm_out, "llm"

@@ -878,9 +878,11 @@ def context_diacritize(text, requested=None):
         catt_out = _catt_diacritize_safe(text)
         if catt_out:
             return catt_out, "catt"
-    if mode in ("auto", "onnx") or (mode == "catt" and CATT_SUBMIT_MAX <= 0):
+    if mode in ("auto", "onnx", "llm") or (mode == "catt" and CATT_SUBMIT_MAX <= 0):
         # CATT مُعطَّل افتراضياً (القياس: >60s حتى لـ 250 حرفاً على CPU
         # Render) — الطلبُ الصريح له يهبط على ONNX لا على النص الخام.
+        # و LLM الصريح عند فشله/مهله (شوهد 30s ثم لا نتيجة) يهبط أيضاً على
+        # ONNX لا على النص الخام — لا يُسلَّم نصٌّ بلا تشكيل أبداً.
         try:
             return get_diacritizer().diacritize(text), "onnx"
         except Exception:

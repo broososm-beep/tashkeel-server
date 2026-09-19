@@ -162,7 +162,7 @@ CATT_TIMEOUT = float(os.environ.get("CATT_TIMEOUT", "60"))
 # حدّ أمان زمني: نصوص أطول من CATT_FAST_LIMIT (خاصة الكبيرة/المختلطة) تُتجاوز
 # مباشرة إلى ONNX لأن معالجة CATT التسلسلية على وحدات Render المجانية تتجاوز
 # مهلة العميل (60s) فيعود التطبيق بـ TimeoutException رغم نجاح الخادم لاحقاً.
-CATT_FAST_LIMIT = int(float(os.environ.get("CATT_FAST_LIMIT", "2000")))
+CATT_FAST_LIMIT = int(float(os.environ.get("CATT_FAST_LIMIT", "8000")))
 # حدّ أدنى لاعتبار نتيجة CATT مشكَّلة (مثلاً النص الخام القصير يبقى بلا تنوين ظاهر).
 CATT_MIN_LEN = int(float(os.environ.get("CATT_MIN_LEN", "0")))
 

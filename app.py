@@ -119,6 +119,12 @@ GEMINI_RATE_COOLDOWN = float(os.environ.get("GEMINI_RATE_COOLDOWN", "75"))
 TTS_VOICE = os.environ.get("TASHKEEL_TTS_VOICE", "ar-EG-ShakirNeural").strip()
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 TTS_TIMEOUT = int(float(os.environ.get("TTS_TIMEOUT", "45")))
+# النص الطويل يُقسَّم على الخادم ويُولَّف بالتوازي (مقاطع ملفات MP3 تسلسلية
+# متسقة) حتى لا تتجاوز الدفعة الواحدة مهلة synthesize على مثيل مجاني مضغوط.
+# EDGE_CHUNK_CHARS: حد كل مقطع (حروف). فوقه يُقسَّم النص عند نهاية جملة.
+# EDGE_CHUNK_WORKERS: عدد تدفقات edge-tts المتوازية (3 وسط وسط).
+EDGE_CHUNK_CHARS = int(float(os.environ.get("EDGE_CHUNK_CHARS", "700")))
+EDGE_CHUNK_WORKERS = int(float(os.environ.get("EDGE_CHUNK_WORKERS", "3")))
 EDGE_FALLBACK_VOICE = (
     os.environ.get("EDGE_TTS_VOICE", "ar-EG-ShakirNeural").strip() or "ar-EG-ShakirNeural"
 )
@@ -311,6 +317,11 @@ GEMINI_SYSTEM_PROMPT = (
 # تجمعان عشرة-الوزن للاستدعاء الشارد: استدعاء Gemini، وتوليف الصوت.
 _llm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm")
 _tts_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts")
+# عُمّال التوليف المفصَّل للنص الطويل — منفصل عن _tts_pool حتى لا يحصر
+# التنفيذ المتوازي (المقطع الرئيسي يحجز عاملاً في _tts_pool أثناء انتظاره).
+_synth_chunk_pool = ThreadPoolExecutor(
+    max_workers=EDGE_CHUNK_WORKERS, thread_name_prefix="ttschunk"
+)
 
 _diacritizer = None
 _di_lock = threading.Lock()
@@ -1000,19 +1011,104 @@ async def _synthesize_async(text, voice, rate_pct):
 
 
 def synthesize(text, voice, rate_pct=0):
-    """توليف MP3 من نص (مشكَّل أو خام) مع مهلة قاتلة — فشل → None."""
+    """توليف MP3 من نص (مشكَّل أو خام) مع مهلة قاتلة — فشل → None.
+
+    النص الطويل (~فوق EDGE_CHUNK_CHARS حرفاً) يُقسَّم إلى مقاطع تُولَّف
+    بالتوازي عبر عُمّال edge-tts ثم تُدمج MP3 واحدة متسلسلة — فتنتهي الدفعة
+    في زمن أطول مقطعٍ لا مجموعَها، وتُجاوَز بذلك مهلة TTS_TIMEOUT على مثيل
+    مجاني مضغوط (كانت الدفعة الواحدة تتجاوزها فيفشل حتى سقوط «النص الخام»).
+    """
+    if len(text) <= EDGE_CHUNK_CHARS:
+        return _synth_segment(text, voice, rate_pct)
+
+    segments = _split_speech_segments(text, EDGE_CHUNK_CHARS)
+    if len(segments) == 1:
+        return _synth_segment(text, voice, rate_pct)
+    logger.info("نطق طويل (%d حرفاً): %d مقطعاً بالتوازي (%d عُمّال).",
+                len(text), len(segments), EDGE_CHUNK_WORKERS)
+    futs = [
+        _synth_chunk_pool.submit(_synth_segment, seg, voice, rate_pct)
+        for seg in segments
+    ]
+    parts = []
+    for fut in futs:
+        try:
+            audio = fut.result(timeout=TTS_TIMEOUT + 12)
+        except TimeoutError:
+            logger.error("تأخرت عملية النطق أكثر من %ss؛ نُعيد فشلاً للاسترجاع.",
+                         TTS_TIMEOUT)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.error("فشل النطق: %s:%s", type(exc).__name__, exc)
+            return None
+        if not audio:
+            return None
+        parts.append(_strip_id3(audio))
+    merged = b"".join(parts)
+    if not _looks_like_mp3(merged):
+        logger.error("دَعم المقاطع لا يُنتج MP3 صالحة: %d بايت.", len(merged))
+        return None
+    return merged
+
+
+def _synth_segment(text, voice, rate_pct):
+    """توليف مقطع واحد كامل (وهو الوحدة الفعّالة في المسار المفصَّل)."""
     fut = _tts_pool.submit(
         lambda: asyncio.run(_synthesize_async(text, voice, rate_pct))
     )
     try:
-        audio = fut.result(timeout=TTS_TIMEOUT + 12)
-        return audio if audio else None
+        return fut.result(timeout=TTS_TIMEOUT + 12)
     except TimeoutError:
-        logger.error("تأخرت عملية النطق أكثر من %ss؛ نُعيد فشلاً للاسترجاع.", TTS_TIMEOUT)
+        logger.error("تأخرت عملية النطق أكثر من %ss؛ نُعيد فشلاً للاسترجاع.",
+                     TTS_TIMEOUT)
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("فشل النطق: %s:%s", type(exc).__name__, exc)
         return None
+
+
+def _split_speech_segments(text, max_chars):
+    """يقسّم نصاً طويلاً على حدود الجمل/الأسطر (ثم مسافات) دون فصم كلمة.
+
+    يُفضَّل القَطع بعد نهاية جملة (نقطة/استفهام/تعجّب/فاصلة منقوطة/سطر) داخل
+    نافذة max_chars؛ وإن لم تُوجد، يُؤخذ آخر مسافة — فلا يُقصُّ كلامٌ في نصفه.
+    """
+    segments = []
+    start = 0
+    total = len(text)
+    breaks = ".!؟?؛:…\n"
+    while start < total:
+        end = min(start + max_chars, total)
+        cut = None
+        i = end - 1
+        while i > start:
+            ch = text[i]
+            if ch in breaks:
+                cut = i + 1
+                break
+            if ch.isspace():
+                cut = i + 1
+            i -= 1
+        if cut is not None:
+            end = cut
+        seg = text[start:end]
+        if seg.strip():
+            segments.append(seg)
+        start = max(end, start + 1)
+    return segments or [text]
+
+
+def _strip_id3(data):
+    """يزيل غلاف ID3v2 (داخل أول 10 بايت) من مقطع MP3 ليسهل دمجُ المقاطع.
+
+    يكتفي بغلاف واحد في البداية؛ إن لم يكن ID3 يعيد البايتات كما هي.
+    """
+    if data[:3] == b"ID3" and len(data) >= 10:
+        size = 0
+        for byte in data[6:10]:
+            size = (size << 7) | (byte & 0x7F)
+        return data[10 + size:]
+    return data
 
 
 # ════════════════════════════════════════════════════════════════

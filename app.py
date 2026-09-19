@@ -961,6 +961,15 @@ def build_ssml(text, voice, lang="ar-SA"):
     )
 
 
+# أصوات تُعاد توجيهها إلى بدائل مدعومة: «Hoda» صوتٌ يستخدمه تطبيق Microsoft
+# Translator داخلياً لكنه غير مطروح في خدمة edge-tts ولا REST Azure (رفض 400)
+# — نستبدله بـ Salma (نفس العائلة المصرية المؤنثة، مدعومة في المحركين كليهما)
+# حتى لا يفشل أي طلب يمر بصوت Hoda من الواجهات أو الطلبات القديمة.
+_VOICE_ALIASES = {
+    "ar-EG-HodaNeural": "ar-EG-SalmaNeural",
+}
+
+
 def _edge_voice(voice):
     """يرحّل أي صوت إلى صوت Edge صالح، فتسلم الواجهة من أصوات Gemini.
 
@@ -968,6 +977,7 @@ def _edge_voice(voice):
     كل مسار Edge يعبر هذا الاتجاه فيُسترجع صوت السقوط الآلي بدلًا منها.
     """
     v = (voice or "").strip() or TTS_VOICE
+    v = _VOICE_ALIASES.get(v, v)
     if v in GEMINI_VOICES:
         logger.warning(
             "صوت Gemini (%s) لا يصلح لمحرك Edge؛ نستخدم (%s).", v, EDGE_FALLBACK_VOICE
@@ -1436,12 +1446,11 @@ def _azure_ssml(text, voice, rate_pct):
 
 
 # القائمة البيضاء لأصوات Azure العربية المسموح زجّها في SSML — صوت الطلب يُحترم
-# لنطق «Hoda»/الأصوات العصبية المفضلة من التطبيق، وأي اسم خارجها يرتد إلى
-# AZURE_TTS_VOICE (يمنع حقن SSML ويرفض أصواتًا غير عربية في نتائج القياسات).
+# لنطق الأصوات العصبية المفضلة من التطبيق، وأي اسم خارجها (أو Hoda المحجوب من
+# REST) يعود إلى AZURE_TTS_VOICE فوراً (يمنع حقن SSML وأصواتٍ غير عربية).
 _AZURE_VOICE_ALLOWLIST = frozenset([
-    "ar-EG-HodaNeural",      # صوت Microsoft Translator (الافتراضي الجديد في التطبيق)
-    "ar-EG-ShakirNeural",
     "ar-EG-SalmaNeural",
+    "ar-EG-ShakirNeural",
     "ar-SA-HamedNeural",
     "ar-SA-ZariyahNeural",
     "ar-SA-AyshaNeural",
@@ -1462,8 +1471,9 @@ _AZURE_VOICE_ALLOWLIST = frozenset([
 
 
 def _azure_voice(voice):
-    """صوت آمن لـ Azure: [voice] إن كان ضمن القائمة البيضاء وإلا AZURE_TTS_VOICE."""
-    v = (voice or "").strip()
+    """صوت آمن لـ Azure: [voice] (بعد تحويل الـ aliases) إن كان ضمن القائمة
+    البيضاء وإلا AZURE_TTS_VOICE."""
+    v = _VOICE_ALIASES.get((voice or "").strip(), (voice or "").strip())
     if v in _AZURE_VOICE_ALLOWLIST:
         return v
     base = (AZURE_TTS_VOICE or "").strip()

@@ -47,6 +47,10 @@ Endpoints جديدة (إضافية، اختيارية):
     AZURE_MAX_CHARS    حدّ أقصى لنص Azure لكل طلب، افتراضي 4000
     AZURE_TIMEOUT      مهلة استدعاء Azure بالثواني، افتراضي 40
     AZURE_COOLDOWN     كولداون السقوط بعد فشل Azure (ثوانٍ)، افتراضي 900
+    MICROSOFT_TRANSLATOR_KEY   مفتاح Microsoft Translator Text API (F0: 2M حرف/شهر) — POST /translate
+    MICROSOFT_TRANSLATOR_REGION منطقة المترجم (افتراضي global) — تُرسل في Ocp-Apim-Subscription-Region
+    TRANSLATE_MAX_CHARS حدّ أقصى لكل طلب ترجمة (حروف)، افتراضي 4000
+    TRANSLATE_TIMEOUT  مهلة الترجمة بالثواني، افتراضي 40
     CARTESIA_API_KEY   مفتاح Cartesia Sonic — 20K حرف/شهر مجاني متجدد (سيرفر-محض)
     CARTESIA_VOICE_ID  معرّف صوت عربي ذكور (يُجلب تلقائياً من القائمة إن تُرك فارغاً)
     CARTESIA_MAX_CHARS حدّ أقصى لنص Cartesia لكل طلب، افتراضي 2000
@@ -145,6 +149,25 @@ AZURE_TTS_VOICE = os.environ.get("AZURE_TTS_VOICE", "ar-EG-ShakirNeural").strip(
 AZURE_MAX_CHARS = int(float(os.environ.get("AZURE_MAX_CHARS", "4000")))
 AZURE_TIMEOUT = float(os.environ.get("AZURE_TIMEOUT", "40"))
 AZURE_COOLDOWN = float(os.environ.get("AZURE_COOLDOWN", "900"))
+
+# ترجمة النصوص (Microsoft Translator Text — حصة F0 منفصلة عن Azure Speech).
+# تُستخدم برأس Ocp-Apim-Subscription-Key فيُحجب تلقائيًا بالبرادع السجلي.
+MICROSOFT_TRANSLATOR_KEY = (
+    os.environ.get("MICROSOFT_TRANSLATOR_KEY", "")
+    or os.environ.get("AZURE_TRANSLATOR_KEY", "")
+).strip()
+MICROSOFT_TRANSLATOR_REGION = (
+    os.environ.get("MICROSOFT_TRANSLATOR_REGION", "")
+    or os.environ.get("AZURE_TRANSLATOR_REGION", "")
+    or "global"
+).strip()
+TRANSLATE_MAX_CHARS = int(float(os.environ.get("TRANSLATE_MAX_CHARS", "4000")))
+TRANSLATE_TIMEOUT = float(os.environ.get("TRANSLATE_TIMEOUT", "40"))
+# لغات مقبولة الهدف (منع اتورييل حقن معامل to).
+_TRANSLATE_TO_ALLOW = frozenset(
+    re.split(r"[,;\s]+", os.environ.get("TRANSLATE_TO_ALLOW", "ar,en,fr,es,de,tr,fa,ur"))
+)
+_TRANSLATE_TO_DEFAULT = "ar"
 
 CARTESIA_API_KEY = (
     os.environ.get("CARTESIA_API_KEY", "") or os.environ.get("CARTESIA_KEY", "")
@@ -1412,7 +1435,42 @@ def _azure_ssml(text, voice, rate_pct):
     )
 
 
-def _azure_tts_bytes(text, rate_pct):
+# القائمة البيضاء لأصوات Azure العربية المسموح زجّها في SSML — صوت الطلب يُحترم
+# لنطق «Hoda»/الأصوات العصبية المفضلة من التطبيق، وأي اسم خارجها يرتد إلى
+# AZURE_TTS_VOICE (يمنع حقن SSML ويرفض أصواتًا غير عربية في نتائج القياسات).
+_AZURE_VOICE_ALLOWLIST = frozenset([
+    "ar-EG-HodaNeural",      # صوت Microsoft Translator (الافتراضي الجديد في التطبيق)
+    "ar-EG-ShakirNeural",
+    "ar-EG-SalmaNeural",
+    "ar-SA-HamedNeural",
+    "ar-SA-ZariyahNeural",
+    "ar-SA-AyshaNeural",
+    "ar-AE-HamdanNeural",
+    "ar-SY-AmanyNeural",
+    "ar-IQ-BasselNeural",
+    "ar-QA-AmalNeural",
+    "ar-KW-FahedNeural",
+    "ar-BH-AliNeural",
+    "ar-OM-AbdullahNeural",
+    "ar-YE-MaryamNeural",
+    "ar-LB-LaylaNeural",
+    "ar-JO-SanaNeural",
+    "ar-DZ-IsmaelNeural",
+    "ar-MA-MounaNeural",
+    "ar-TN-HediNeural",
+])
+
+
+def _azure_voice(voice):
+    """صوت آمن لـ Azure: [voice] إن كان ضمن القائمة البيضاء وإلا AZURE_TTS_VOICE."""
+    v = (voice or "").strip()
+    if v in _AZURE_VOICE_ALLOWLIST:
+        return v
+    base = (AZURE_TTS_VOICE or "").strip()
+    return base if base in _AZURE_VOICE_ALLOWLIST else "ar-EG-ShakirNeural"
+
+
+def _azure_tts_bytes(text, rate_pct, voice=None):
     """يولّف عبر Azure Speech REST (بلا SDK ثقيل) ويعيد MP3 bytes أو None.
 
     أي خطأ يُدخل المحرك كولداوناً سلبياً (لا تُهدر مهل ناجية مع محرك ميت).
@@ -1435,7 +1493,7 @@ def _azure_tts_bytes(text, rate_pct):
     if len(text) > AZURE_MAX_CHARS:
         logger.info("نص فوق %d حرفاً؛ نتجاوز Azure إلى Edge.", AZURE_MAX_CHARS)
         return None
-    voice = AZURE_TTS_VOICE
+    voice = _azure_voice(voice or AZURE_TTS_VOICE)
     ssml = _azure_ssml(text, voice, rate_pct)
     req = urllib.request.Request(
         f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
@@ -1617,9 +1675,9 @@ def _synth_ladder(text, voice, rate, requested_engine=None, diacrit=None):
             if audio is not None:
                 return audio, "cartesia", _cartesia_voice_id() or "cartesia:auto", diac_engine
         else:
-            audio = _azure_tts_bytes(stripped, rate)
+            audio = _azure_tts_bytes(stripped, rate, voice or AZURE_TTS_VOICE)
             if audio is not None:
-                return audio, "azure", AZURE_TTS_VOICE, diac_engine
+                return audio, "azure", _azure_voice(voice or AZURE_TTS_VOICE), diac_engine
     if preferred in ("cartesia", "azure"):
         logger.warning(
             "المحرك المطلوب %s لم يُنتج صوتاً رغم توافره؛ السقوط الآلي إلى Edge.",
@@ -1755,6 +1813,70 @@ def _diacrit_cached(text, mode):
             _DIACRIT_CACHE.pop(next(iter(_DIACRIT_CACHE)))
         _DIACRIT_CACHE[key] = result
     return result
+
+
+def _translate_to_arabic(text, to):
+    """ترجمة نصٍّ واحد إلى [to] عبر Microsoft Translator Text API.
+
+    يعيد (النص_المترجم, None) على النجاح أو (None, رسالة_داخلية) على الفشل.
+    لا يُستدعى بلا مفتاح (المنفذ يعيد 503 قبل الوصول هنا). المفتاح يظل
+    سيرفر-محض ويُحجب شكلاً في السجلات ببرادع Ocp-Apim.
+    """
+    body = json.dumps([{"text": text}], ensure_ascii=False).encode("utf-8")
+    url = (
+        "https://api.cognitive.microsofttranslator.com/translate"
+        f"?api-version=3.0&to={to}"
+    )
+    headers = {
+        "Ocp-Apim-Subscription-Key": MICROSOFT_TRANSLATOR_KEY,
+        "Ocp-Apim-Subscription-Region": MICROSOFT_TRANSLATOR_REGION,
+        "Content-Type": "application/json",
+    }
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=TRANSLATE_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.error("ترجمة Microsoft رفضت (HTTP %s) — %s", exc.code, detail[:300])
+        return None, f"الخادم رفض الترجمة (HTTP {exc.code})"
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطأ اتصال بخدمة الترجمة: %s:%s", type(exc).__name__, exc)
+        return None, "تعذّر الاتصال بخدمة الترجمة"
+    try:
+        translated = data[0]["translations"][0]["text"].strip()
+    except (KeyError, IndexError, TypeError):
+        logger.error("استجابة ترجمة غير متوقعة: %s", str(data)[:300])
+        return None, "استجابة الترجمة غير متوقعة"
+    if not translated:
+        return None, "الترجمة أرجعت نصًا فارغًا"
+    return translated, None
+
+
+@app.route("/translate", methods=["POST"])
+def translate_endpoint():
+    """ترجمة نص إلى العربية (اختياريا لغة أخرى) في JSON: {"text", "to"?}.
+
+    إن لم يُضبط MICROSOFT_TRANSLATOR_KEY يعود 503 «translation not configured»
+    ليعرض التطبيق رسالة واضحة بدل خلطٍ بأخطاء النطق. سقف TRANSLATE_MAX_CHARS
+    لكل طلب (التطبيق يقسم النص الطويل شرائح تتابعية ≤ 3500) وجسم JSON بلا
+    حدّ سطر (لا يقع في حبس gunicorn كما POST /tts).
+    """
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    to = (payload.get("to") or _TRANSLATE_TO_DEFAULT).strip()
+    if not text:
+        return jsonify({"error": "empty text"}), 400
+    if len(text) > TRANSLATE_MAX_CHARS:
+        return jsonify({"error": "text too long"}), 413
+    if to not in _TRANSLATE_TO_ALLOW:
+        to = _TRANSLATE_TO_DEFAULT
+    if not MICROSOFT_TRANSLATOR_KEY:
+        return jsonify({"error": "translation not configured"}), 503
+    translated, err = _translate_to_arabic(text, to)
+    if translated is None:
+        return jsonify({"error": err or "translation failed"}), 502
+    return jsonify({"translated": translated})
 
 
 @app.route("/tashkeel", methods=["POST"])
